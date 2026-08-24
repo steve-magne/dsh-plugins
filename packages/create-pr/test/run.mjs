@@ -12,17 +12,19 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	CONVENTIONAL_SUBJECT_RE,
+	buildPrBody,
 	classifyChecks,
 	createPrLauncher,
 	deterministicFallbackMessage,
 	extractPrUrl,
 	parseConventionalMessage,
 	parseGitHubOwnerRepo,
+	parseStatEntries,
 } from "../lib/index.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -107,6 +109,12 @@ function installFakeGh(dir) {
 			'    case "$sub" in',
 			"      create)",
 					'log "pr create";',
+			'        prev="";',
+			'        for a in "$@"; do',
+			'          if [ "$prev" = "--title" ]; then printf "%s" "$a" > "$STATE/created-title.txt"; fi',
+			'          if [ "$prev" = "--body" ]; then printf "%s" "$a" > "$STATE/created-body.txt"; fi',
+			'          prev="$a"',
+			'        done',
 			'        n=$(cat "$STATE/next-pr" 2>/dev/null || echo 1)',
 			'        echo $((n+1)) > "$STATE/next-pr"',
 			'        echo "https://github.com/acme/widget/pull/$n"',
@@ -257,14 +265,28 @@ async function call(launcher, options) {
 	return { status: fake.status, payload: JSON.parse(fake.body) };
 }
 
-function llmStub(subject, body) {
-	const text = [subject, "", body ?? ""].join("\n");
+/**
+ * A scripted LLM: one reply per call (the last repeats), every request
+ * recorded in `.calls` so tests can assert exactly how many model round-trips
+ * the pipeline spent and what evidence each prompt carried.
+ */
+function llmScript(responses) {
+	let index = 0;
+	const calls = [];
 	return {
-		stream: async function* () {
+		calls,
+		stream: async function* (request) {
+			calls.push(request);
+			const text = responses[Math.min(index, responses.length - 1)] ?? "";
+			index += 1;
 			yield { type: "text-delta", index: 0, text };
 			yield { type: "finish", index: 0, reason: { kind: "stop" } };
 		},
 	};
+}
+
+function llmStub(subject, body) {
+	return llmScript([[subject, "", body ?? ""].join("\n")]);
 }
 
 function agentRecorder(sessionId) {
@@ -381,7 +403,45 @@ await test("pure helpers: slug parsing, rollup classification, message parsing",
 
 	assert.match(deterministicFallbackMessage({ mode: "commit", statText: "a.md | 2 ++\nb.md | 3 ++" }).subject, /^docs:/);
 	assert.match(deterministicFallbackMessage({ mode: "commit", statText: "src/x.ts | 4 ++" }).subject, /^(chore|feat):/);
-	assert.match(deterministicFallbackMessage({ mode: "pr", statText: "s1---s2---" }).subject, /land 2 commits/);
+
+	// pr fallback: dominant type + unanimous scope from the branch's own commits.
+	const prFallback = deterministicFallbackMessage({
+		mode: "pr",
+		statText: "lib/a.ts | 3 ++\nlib/b.ts | 1 -\nimg.png | Bin 0 -> 12 bytes",
+		commitSubjects: ["feat(api): add endpoint", "fix(api): guard it"],
+	});
+	assert.equal(prFallback.subject, "feat(api): land 2 commits across 3 files");
+	// pr fallback: a single conventional commit IS the honest PR title.
+	const solo = deterministicFallbackMessage({
+		mode: "pr",
+		statText: "",
+		commitSubjects: ["refactor(ui): tidy buttons"],
+	});
+	assert.equal(solo.subject, "refactor(ui): tidy buttons");
+
+	assert.deepEqual(
+		parseStatEntries(
+			"a.ts | 5 +++--\nb.png | Bin 0 -> 9 bytes\nc.ts | 0\n 2 files changed, 6 insertions(+), 2 deletions(-)",
+		),
+		[
+			{ path: "a.ts", insertions: 3, deletions: 2, binary: false },
+			{ path: "b.png", insertions: 0, deletions: 0, binary: true },
+			{ path: "c.ts", insertions: 0, deletions: 0, binary: false },
+		],
+	);
+
+	const bodyText = buildPrBody({
+		summary: "- does the thing",
+		statText: "src/x.ts | 4 +++\nsrc/y.ts | 2 --",
+		commitSubjects: ["feat(x): one", "chore(x): two"],
+	});
+	assert.deepEqual(bodyText.split("\n").slice(0, 2), ["## Summary", "- does the thing"]);
+	assert.match(
+		bodyText,
+		/## Changes\n- src\/x\.ts \(\+3\)\n- src\/y\.ts \(-2\)\n\n## Commits\n- feat\(x\): one\n- chore\(x\): two/,
+	);
+	assert.match(buildPrBody({}).split("\n")[1], /No summary available/);
+	assert.doesNotMatch(buildPrBody({ summary: "- s" }), /## Commits/);
 
 	const url = extractPrUrl("some noise\nhttps://github.com/acme/widget/pull/42\nnoise");
 	assert.equal(url.number, 42);
@@ -414,16 +474,22 @@ await test("refuses to resolve a repository without any input", async () => {
 	launcher.shutdown();
 });
 
-// Happy path: dirty tree -> LLM commit -> push -> pr create -> CI passes.
+// Happy path: dirty tree -> LLM commit + separate LLM PR text -> push -> pr
+// create -> CI passes. The PR title/body must summarize the whole branch.
 {
 	const project = await makeProject();
 	const agent = agentRecorder("session-happy");
 	const warnings = [];
-	const launcher = makeLauncher({
-		llm: llmStub("feat(widget): add sparkle engine", "- adds sparkle"),
-		agent,
-		warnings,
-	});
+	const llm = llmScript([
+		["feat(widget): add sparkle engine", "", "- adds sparkle"].join("\n"),
+		[
+			"feat(widget): ship sparkle pipeline",
+			"",
+			"- adds the sparkle engine",
+			"- wires it into the build",
+		].join("\n"),
+	]);
+	const launcher = makeLauncher({ llm, agent, warnings });
 
 	await test("happy path: commit, push, PR, CI pass — with one LLM call only", async () => {
 		fakeStateDir = await makeStateDir();
@@ -445,15 +511,33 @@ await test("refuses to resolve a repository without any input", async () => {
 		assert.equal(record.prNumber, 1, "first run creates PR #1");
 		assert.equal(record.prUrl, "https://github.com/acme/widget/pull/1");
 		assert.equal(record.commitSubject, "feat(widget): add sparkle engine");
+		assert.equal(record.prTitle, "feat(widget): ship sparkle pipeline");
 		assert.match(record.commitSubject, CONVENTIONAL_SUBJECT_RE);
 
-		// The LLM-generated commit really landed with that exact subject.
+		// Exactly two model round-trips: one for the commit message, one for the
+		// PR title/summary — and the PR prompt carries branch-level evidence.
+		assert.equal(llm.calls.length, 2, "one LLM call for commit, one for the PR text");
+		const prPrompt = String(llm.calls[1]?.messages?.[0]?.content?.[0]?.text ?? "");
+		assert.match(prPrompt, /Branch commit subjects:/);
+		assert.match(prPrompt, /feat\(widget\): add sparkle engine/);
+		assert.match(prPrompt, /sparkle\.ts/, "the PR composer sees diff/stat evidence");
+
+		// The commit really landed with that exact subject...
 		const logSubject = git(["log", "-1", "--format=%s"], project.root).trim();
 		assert.equal(logSubject, "feat(widget): add sparkle engine");
 		// ...and was pushed to the bare origin on the feature branch.
 		const remoteSha = git(["ls-remote", project.origin, project.branch], project.dir).trim();
 		const localSha = git(["rev-parse", "HEAD"], project.root).trim();
 		assert.ok(remoteSha.startsWith(localSha), "branch pushed to origin");
+
+		// The PR itself: summarized title + structured Claude Code-style body.
+		const ghTitle = await readFile(join(fakeStateDir, "created-title.txt"), "utf8");
+		const ghBody = await readFile(join(fakeStateDir, "created-body.txt"), "utf8");
+		assert.equal(ghTitle, "feat(widget): ship sparkle pipeline");
+		assert.match(ghBody, /^## Summary\n- adds the sparkle engine\n- wires it into the build/m);
+		assert.match(ghBody, /## Changes\n- sparkle\.ts \(\+1\)/);
+		assert.match(ghBody, /## Commits\n- feat\(widget\): add sparkle engine/);
+		assert.match(ghBody, /Opened via the DSH create-pr plugin/);
 
 		// Deterministic plumbing only — exactly one pr create, no second PR.
 		const calls = await readCalls(fakeStateDir);
@@ -608,6 +692,48 @@ await test("refuses to resolve a repository without any input", async () => {
 	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
 }
 
+// Clean tree with several existing commits and a useless LLM: this is exactly
+// the shape that used to produce "chore: land N commits" + an empty body. The
+// title must now derive type/scope from the branch's own conventional commits
+// and the body must still list the impacted files deterministically.
+{
+	const project = await makeProject();
+	await writeFile(join(project.root, "alpha.ts"), "export const alpha = 1;\n", "utf8");
+	git(["add", "."], project.root);
+	git(["commit", "-q", "-m", "feat(core): add alpha module"], project.root);
+	await writeFile(
+		join(project.root, "beta.test.ts"),
+		'import assert from "node:assert/strict";\nassert.ok(true);\n',
+		"utf8",
+	);
+	git(["add", "."], project.root);
+	git(["commit", "-q", "-m", "fix(core): harden beta"], project.root);
+
+	const launcher = makeLauncher({ llm: llmStub("just some prose, no convention", "") });
+
+	await test("clean tree: PR title derives from commits; body lists files without any LLM", async () => {
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const created = await call(launcher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: "session-clean-fallback", root: project.root },
+		});
+		const record = await waitFor(launcher, created.payload.id, ["passed"]);
+		assert.equal(record.commitSubject, null, "a clean tree commits nothing");
+		assert.equal(record.prTitle, "feat(core): land 2 commits across 2 files");
+		const ghTitle = await readFile(join(fakeStateDir, "created-title.txt"), "utf8");
+		assert.equal(ghTitle, record.prTitle);
+		const ghBody = await readFile(join(fakeStateDir, "created-body.txt"), "utf8");
+		assert.match(ghBody, /## Summary\n- feat\(core\): add alpha module\n- fix\(core\): harden beta/);
+		assert.match(ghBody, /## Changes\n- alpha\.ts \(\+1\)\n- beta\.test\.ts \(\+2\)/);
+		assert.match(ghBody, /## Commits\n- feat\(core\): add alpha module\n- fix\(core\): harden beta/);
+	});
+
+	launcher.shutdown();
+	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
+}
+
 // Validation guards.
 {
 	const launcher = makeLauncher({ llm: llmStub("feat(x): y", "") });
@@ -653,6 +779,13 @@ await test("refuses to resolve a repository without any input", async () => {
 		assert.match(record.commitSubject, CONVENTIONAL_SUBJECT_RE);
 		const logSubject = git(["log", "-1", "--format=%s"], project.root).trim();
 		assert.equal(logSubject, record.commitSubject);
+
+		// The PR text fell back too — yet the body still carries the structured
+		// deterministic evidence (commit-subject summary + exact file list).
+		assert.match(record.prTitle ?? "", CONVENTIONAL_SUBJECT_RE);
+		const fallbackBody = await readFile(join(fakeStateDir, "created-body.txt"), "utf8");
+		assert.match(fallbackBody, /## Summary\n- docs: update 1 file/);
+		assert.match(fallbackBody, /## Changes\n- notes\.md \(\+1\)/);
 		fallbackLauncher.shutdown();
 		await rm(project.dir, { recursive: true, force: true }).catch(() => {});
 	});

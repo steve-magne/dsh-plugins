@@ -176,7 +176,10 @@ window.__ModuleLoader__.load({
 				: "";
 			const parts = [
 				`${run.branch} → ${run.prUrl ?? "…"}`,
-				run.commitSubject ? `commit: ${run.commitSubject}` : "",
+				run.prTitle ? `pr: ${run.prTitle}` : "",
+				run.commitSubject && run.commitSubject !== run.prTitle
+					? `commit: ${run.commitSubject}`
+					: "",
 				checks,
 				run.note ? `note: ${run.note}` : "",
 				run.error ? `error: ${run.error}` : "",
