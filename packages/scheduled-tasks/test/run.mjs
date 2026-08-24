@@ -296,12 +296,13 @@ async function ghPathFor(mode) {
 	return ghPaths[mode];
 }
 
-async function buildController({ agents, sessions, ghMode } = {}) {
+async function buildController({ agents, sessions, ghMode, llm } = {}) {
 	return createScheduledTasks({
 		spawn: spawnStub,
 		resolveExecutable: async (command) => (command === "gh" ? ghPathFor(ghMode) : command),
 		agents,
 		sessions,
+		llm,
 		defaultModel: () => ({ provider: "deepseek", model: "stub-model" }),
 		storePath: join(scratchRoot, `store-${Math.random().toString(36).slice(2)}.json`),
 		pollMs: 60_000, // the scheduler is driven manually through tick()
@@ -319,6 +320,63 @@ await test("answers unknown endpoints with 404 and rejects foreign hosts with 40
 	assert.equal(missing.status, 404);
 	const evil = await call(controller, { method: "GET", url: `${API}/tasks`, host: "evil.example:3080" });
 	assert.equal(evil.status, 403);
+});
+
+await test("/meta mirrors the chat catalog: routable ids, per-provider groups, tolerant failures", async () => {
+	const controller = await buildController({
+		llm: {
+			listProviders: async () => [
+				{ id: "deepseek", name: "DeepSeek" },
+				{ id: "openai", name: "OpenAI" },
+				"bare-id-provider",
+			],
+			listModels: async (providerId) => {
+				if (providerId === "deepseek") {
+					return [
+						{ provider: "deepseek", id: "deepseek-chat", name: "DeepSeek Chat" },
+						{ id: "deepseek-reasoner", name: "DeepSeek Reasoner" },
+					];
+				}
+				throw new Error(`discovery down for ${providerId}`);
+			},
+		},
+	});
+	const meta = await call(controller, { method: "GET", url: `${API}/meta` });
+	assert.equal(meta.status, 200);
+	assert.deepEqual(meta.payload.defaults, { provider: "deepseek", model: "stub-model" });
+
+	// Providers carry routable IDS (never display names — that mismatch used to
+	// make listModels throw and the form's model list render empty), with the
+	// name kept aside for presentation.
+	assert.deepEqual(
+		meta.payload.providers,
+		[
+			{ id: "deepseek", name: "DeepSeek" },
+			{ id: "openai", name: "OpenAI" },
+			{ id: "bare-id-provider", name: "bare-id-provider" },
+		],
+	);
+
+	// One group per provider whose catalog answered, models keyed by id; a
+	// failing provider degrades out of the groups instead of blanking them all.
+	assert.deepEqual(meta.payload.groups, [
+		{
+			provider: { id: "deepseek", name: "DeepSeek" },
+			models: [
+				{ id: "deepseek-chat", name: "DeepSeek Chat" },
+				{ id: "deepseek-reasoner", name: "DeepSeek Reasoner" },
+			],
+		},
+	]);
+});
+
+await test("/meta stays usable without an llm service (free-text form fallback)", async () => {
+	const controller = await buildController();
+	const meta = await call(controller, { method: "GET", url: `${API}/meta` });
+	assert.equal(meta.status, 200);
+	assert.deepEqual(meta.payload.defaults, { provider: "deepseek", model: "stub-model" });
+	assert.deepEqual(meta.payload.providers, []);
+	assert.deepEqual(meta.payload.groups, []);
 });
 
 await test("task CRUD validates input; cron preview reports next occurrences", async () => {

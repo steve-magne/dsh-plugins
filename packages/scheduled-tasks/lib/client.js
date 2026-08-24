@@ -24,8 +24,14 @@ window.__ModuleLoader__.load({
 
 		//#region styles
 		const css =
-			".stq-root{display:flex;flex-direction:column;gap:14px;font-size:13px;" +
+			// The app never declares a page-wide `color-scheme`, so the browser
+			// renders NATIVE control popups (select dropdowns, datalist
+			// suggestions) in its default scheme — dark text on this dark UI,
+			// i.e. unreadable. Opting this subtree in per active theme makes the
+			// popups follow it (white text on dark in the dark theme).
+			".stq-root{color-scheme:light;display:flex;flex-direction:column;gap:14px;font-size:13px;" +
 			"color:var(--dsw-alias-label-primary,#eee);height:100%;min-height:0}" +
+			"body[data-ds-dark-theme] .stq-root{color-scheme:dark}" +
 			".stq-head{display:flex;align-items:center;justify-content:space-between;gap:12px}" +
 			".stq-title{font-size:15px;font-weight:600;margin:0}" +
 			".stq-sub{font-size:11px;color:var(--dsw-alias-label-tertiary,#8b8b93);margin-top:2px}" +
@@ -165,6 +171,25 @@ window.__ModuleLoader__.load({
 			return task?.model ? `${task.model.provider}/${task.model.model}` : "";
 		}
 
+		/**
+		 * The provider/model pair the form displays and submits: the operator's
+		 * choice first, then the edited task's stored pair, then the deployment
+		 * default, then the first catalog row. Only catalog members drive
+		 * preselection; an unmatched stored/custom value is kept visible through
+		 * a fallback <option> instead of being silently rewritten.
+		 */
+		function resolveSelection(stateValue, initialValue, defaultValue, candidates) {
+			for (const value of [stateValue, initialValue, defaultValue]) {
+				if (value && candidates.includes(value)) return value;
+			}
+			return stateValue || initialValue || defaultValue || "";
+		}
+
+		/** Option label: presentation name with the routable id kept visible. */
+		function optionLabel(row) {
+			return row.name && row.name !== row.id ? `${row.name} (${row.id})` : row.id;
+		}
+
 		const ACTIVE_STATUSES = ["preparing", "worktree", "running", "landing"];
 		//#endregion
 
@@ -227,21 +252,45 @@ window.__ModuleLoader__.load({
 		function TaskForm({ initial, meta, onCancel, onSaved }) {
 			const [workspace, setWorkspace] = react.useState(initial?.workspace ?? "");
 			const [cron, setCron] = react.useState(initial?.cron ?? "0 9 * * 1-5");
-			const [provider, setProvider] = react.useState(
-				initial?.model?.provider ?? meta?.defaultProvider ?? meta?.defaults?.provider ?? "",
-			);
-			const [modelName, setModelName] = react.useState(
-				initial?.model?.model ?? meta?.defaults?.model ?? "",
-			);
+			const [provider, setProvider] = react.useState(initial?.model?.provider ?? "");
+			const [modelName, setModelName] = react.useState(initial?.model?.model ?? "");
 			const [prompt, setPrompt] = react.useState(initial?.prompt ?? "");
 			const [enabled, setEnabled] = react.useState(initial ? initial.enabled !== false : true);
 			const [error, setError] = react.useState("");
 			const [saving, setSaving] = react.useState(false);
 
+			// Same catalog the chat window's model picker shows: provider rows
+			// plus one model group per routable provider id (see /meta).
+			const providers = Array.isArray(meta?.providers) ? meta.providers : [];
+			const groups = Array.isArray(meta?.groups) ? meta.groups : [];
+			const providerIds = providers.map((row) => row.id);
+			const chosenProvider = resolveSelection(
+				provider,
+				initial?.model?.provider,
+				meta?.defaults?.provider,
+				providerIds,
+			);
+			const effProvider =
+				providers.length > 0 && !chosenProvider ? providerIds[0] : chosenProvider;
+			const activeGroup = groups.find((group) => group.provider.id === effProvider) ?? null;
+			const modelRows = activeGroup?.models ?? [];
+			const modelIds = modelRows.map((row) => row.id);
+			const chosenModel =
+				provider === effProvider
+					? resolveSelection(
+							modelName,
+							initial?.model?.provider === effProvider ? initial?.model?.model : undefined,
+							meta?.defaults?.provider === effProvider ? meta?.defaults?.model : undefined,
+							modelIds,
+						)
+					: "";
+			const effModel = modelRows.length > 0 && !chosenModel ? modelIds[0] : chosenModel;
+
 			const ready =
 				workspace.trim().startsWith("/") &&
 				cron.trim() &&
-				modelName.trim() &&
+				effProvider.trim() &&
+				effModel.trim() &&
 				prompt.trim() &&
 				!saving;
 
@@ -251,7 +300,7 @@ window.__ModuleLoader__.load({
 				const body = {
 					workspace: workspace.trim(),
 					cron: cron.trim(),
-					model: { provider: provider.trim(), model: modelName.trim() },
+					model: { provider: effProvider.trim(), model: effModel.trim() },
 					prompt,
 					enabled,
 				};
@@ -261,8 +310,6 @@ window.__ModuleLoader__.load({
 					setSaving(false);
 				});
 			};
-
-			const datalistId = "stq-models-datalist";
 			return react_jsx_runtime.jsxs("div", {
 				className: "stq-form",
 				children: [
@@ -297,33 +344,69 @@ window.__ModuleLoader__.load({
 										className: "stq-row",
 										style: { gap: "6px" },
 										children: [
-											react_jsx_runtime.jsx("select", {
-												value: provider,
-												style: { maxWidth: "40%" },
-												onChange: (event) => setProvider(event.target.value),
-												children: [
-													...(meta?.providers ?? []).map((name) =>
-														react_jsx_runtime.jsx("option", { value: name }, name),
-													),
-													provider && !(meta?.providers ?? []).includes(provider)
-														? react_jsx_runtime.jsx("option", { value: provider }, provider)
-														: null,
-												].filter(Boolean),
-											}),
-											react_jsx_runtime.jsx("input", {
-												value: modelName,
-												list: datalistId,
-												placeholder: "nom-du-modèle",
-												onChange: (event) => setModelName(event.target.value),
-												spellCheck: false,
-											}),
-											react_jsx_runtime.jsx("datalist", {
-												id: datalistId,
-												children: (meta?.models ?? []).map((name) =>
-													react_jsx_runtime.jsx("option", { value: name }, name),
-												),
-											}),
+											providers.length > 0
+												? react_jsx_runtime.jsxs("select", {
+														value: effProvider,
+														style: { maxWidth: "45%" },
+														onChange: (event) => setProvider(event.target.value),
+														children: [
+															...providers.map((row) =>
+																react_jsx_runtime.jsx(
+																	"option",
+																	{ value: row.id, title: row.id, children: optionLabel(row) },
+																	row.id,
+																),
+															),
+															effProvider && !providerIds.includes(effProvider)
+																? react_jsx_runtime.jsx(
+																		"option",
+																		{ value: effProvider, children: `${effProvider} (hors catalogue)` },
+																		effProvider,
+																	)
+																: null,
+														].filter(Boolean),
+													})
+												: react_jsx_runtime.jsx("input", {
+														value: provider,
+														placeholder: "fournisseur",
+														onChange: (event) => setProvider(event.target.value),
+														spellCheck: false,
+													}),
+											modelRows.length > 0
+												? react_jsx_runtime.jsxs("select", {
+														value: effModel,
+														onChange: (event) => setModelName(event.target.value),
+														children: [
+															...modelRows.map((row) =>
+																react_jsx_runtime.jsx(
+																	"option",
+																	{ value: row.id, title: row.id, children: optionLabel(row) },
+																	row.id,
+																),
+															),
+															effModel && !modelIds.includes(effModel)
+																? react_jsx_runtime.jsx(
+																		"option",
+																		{ value: effModel, children: `${effModel} (hors catalogue)` },
+																		effModel,
+																	)
+																: null,
+														].filter(Boolean),
+													})
+												: react_jsx_runtime.jsx("input", {
+														value: provider === effProvider ? modelName : "",
+														placeholder: "nom-du-modèle",
+														onChange: (event) => setModelName(event.target.value),
+														spellCheck: false,
+													}),
 										],
+									}),
+									react_jsx_runtime.jsx("div", {
+										className: "stq-hint",
+										children:
+											modelRows.length > 0
+												? "Même liste que le sélecteur de modèle de la fenêtre de chat."
+												: "Catalogue indisponible pour ce fournisseur : saisissez l'id exact du modèle.",
 									}),
 								],
 							}),
