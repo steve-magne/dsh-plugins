@@ -11,6 +11,7 @@ releases or inherit product quality gates.
 | Plugin | What it adds to the web surface |
 | --- | --- |
 | [`@dsh-plugins/command-deck`](packages/command-deck/) | Right-docked sidebar: save shell commands, run them on the host, stream their output, stop them in one click |
+| [`@dsh-plugins/worktree-launcher`](packages/worktree-launcher/) | One isolated git worktree (`<repo>/.dsh/worktrees/dsh-word-word-word`, based on an up-to-date main) materialized for every new chat session, with an ON-by-default toggle in the composer |
 
 ## Repository layout
 
