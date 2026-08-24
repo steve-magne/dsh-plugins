@@ -64,6 +64,23 @@ assert.equal(
 	"registration must carry a factory",
 );
 
+// ---- manifest contract ------------------------------------------------------
+// The harness client-module scan resolves `<name>/package.json` from the
+// profile directory; Node throws ERR_PACKAGE_PATH_NOT_EXPORTED when `exports`
+// does not declare the subpath, and the scan swallows that error — the plugin
+// then silently never reaches the browser boot graph (host half still runs).
+const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+assert.equal(
+	manifest.exports?.["./package.json"],
+	"./package.json",
+	"exports must expose ./package.json or the boot-graph scan drops this plugin",
+);
+assert.equal(
+	manifest.exports?.["./client"],
+	"./lib/client.js",
+	"exports must map ./client to the browser bundle",
+);
+
 // ---- stub externals -------------------------------------------------------
 
 function makeStubReact() {

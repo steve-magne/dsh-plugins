@@ -6,7 +6,8 @@
 	"description": "DSH web plugin: one isolated git worktree (branch dsh-word-word-word, based on an up-to-date main) materialized for every new chat session",
 	"exports": {
 		".": "./lib/index.js",
-		"./client": "./lib/client.js"
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
 	},
 	"dsh": {
 		"client": {
