@@ -144,8 +144,33 @@ const css = sandbox.appendedStyle.textContent;
 assert.match(css, /\.stq-root\{color-scheme:light;/);
 assert.match(css, /body\[data-ds-dark-theme\] \.stq-root\{color-scheme:dark\}/);
 
+// ---- skill selector contract -------------------------------------------------
+// The form offers an optional skill context right above the Prompt textarea:
+// one select fed by GET /skills?workspace=… with two groups (the edited
+// project's `.agents/skills` and the profile's `<DSH_HOME>/skills`). In this
+// hand-written bundle source order == DOM order inside TaskForm.
+assert.match(
+	source,
+	/getSkills\s*=\s*\(workspace\)\s*=>\s*apiFetch\(`\/skills/,
+	"bundle must fetch the /skills endpoint",
+);
+assert.ok(source.includes("SkillField"), "bundle defines the skill field component");
+const skillFieldAt = source.indexOf('"stq-field stq-skill"');
+const promptLabelAt = source.indexOf('children: "Prompt (injecté');
+assert.ok(skillFieldAt > -1, "skill field carries its marker class");
+assert.ok(promptLabelAt > -1, "prompt label present");
+assert.ok(
+	skillFieldAt < promptLabelAt,
+	"skill selector must render ABOVE the Prompt textarea (source order)",
+);
+for (const fragment of ["Projet (.agents/skills)", "Profil DSH", "— Aucune —", "(introuvable)"]) {
+	assert.ok(source.includes(fragment), `skill select carries '${fragment}'`);
+}
+assert.ok(source.includes("parseSkillValue"), "submission encodes {source,id} for the API");
+
 console.log("client-bundle contract OK:");
 console.log("  - registers under id @dsh-plugins/scheduled-tasks");
 console.log("  - injects 'settings.section' as entry 'scheduled-tasks' labeled 'Scheduled Tasks'");
 console.log("  - page smoke-renders with create button + empty state");
+console.log("  - skill selector above the Prompt field: /skills fetch, both optgroups, fallback option");
 console.log("  - stylesheet injected at materialization, themed color-scheme for native popups");

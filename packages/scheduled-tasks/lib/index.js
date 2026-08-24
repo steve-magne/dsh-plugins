@@ -6,7 +6,8 @@
  *
  *   - the browser half adds a **"Scheduled Tasks" page to the Settings
  *     modal** (`settings.section`): a create/edit form (workspace, model,
- *     cron, prompt) plus the list of defined tasks and their recent runs;
+ *     cron, optional skill context, prompt) plus the list of defined tasks
+ *     and their recent runs;
  *   - tasks persist in ONE JSON file under `$DSH_HOME` (default
  *     `~/.dsh/scheduled-tasks.json`) so schedules survive restarts; firings
  *     missed while the harness was down are skipped, never replayed;
@@ -29,6 +30,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { describeCron, nextRunAfter, nextRunsAfter } from "./cron.js";
 import { createScheduledRunner } from "./runner.js";
+import { createSkillCatalog, defaultSkillsRoot } from "./skills.js";
 import { createTaskStore, normalizeModel } from "./store.js";
 
 /** Services this plugin needs before activation. */
@@ -64,6 +66,7 @@ function httpStatusError(status, message) {
  * @param {string} deps.storePath - absolute JSON persistence path.
  * @param {string} [deps.baseBranch] - force the worktree base branch.
  * @param {string} [deps.ghPath] - explicit gh executable.
+ * @param {string} [deps.skillsRoot] - profile skills directory (`<DSH_HOME>/skills`).
  * @param {number} [deps.pollMs] - scheduler tick period.
  * @param {number} [deps.maxRunMs] - per-firing iteration budget.
  * @param {(message: string) => void} [deps.warn].
@@ -95,12 +98,18 @@ export function createScheduledTasks(deps) {
 		maxRuns: Number.isFinite(deps.maxRuns) ? deps.maxRuns : undefined,
 	});
 
+	const skills = createSkillCatalog({
+		profileRoot: typeof deps.skillsRoot === "string" && deps.skillsRoot.trim() ? deps.skillsRoot : defaultSkillsRoot(),
+		warn,
+	});
+
 	const runner = createScheduledRunner({
 		spawn: deps.spawn,
 		resolveExecutable: deps.resolveExecutable,
 		agents: deps.agents,
 		sessions: deps.sessions,
 		recordRun: (snapshot) => store.recordRun(snapshot),
+		readSkill: (task) => skills.read(task.skill, task.workspace),
 		baseBranch: deps.baseBranch,
 		ghPath: deps.ghPath,
 		maxRunMs: deps.maxRunMs,
@@ -413,6 +422,14 @@ export function createScheduledTasks(deps) {
 				return;
 			}
 
+			if (method === "GET" && pathname === `${API_PREFIX}/skills`) {
+				// The form's skill selector: profile skills plus the edited
+				// workspace's own `.agents/skills`. An unreadable/absent source
+				// degrades to an empty group; the endpoint never fails.
+				sendJson(res, 200, await skills.list(url.searchParams.get("workspace") ?? ""));
+				return;
+			}
+
 			if (method === "POST" && pathname === `${API_PREFIX}/model-normalize`) {
 				const body = await readBody(req);
 				sendJson(res, 200, normalizeModel(body.model ?? body, modelOptions(body).defaultProvider));
@@ -441,6 +458,7 @@ export function createScheduledTasks(deps) {
 		stopScheduler,
 		tick,
 		store,
+		skills,
 		buildMeta,
 		enqueueFire,
 	};
@@ -451,7 +469,7 @@ export function createScheduledTasks(deps) {
  * behind the plugin fiber.
  * @param {object} ctx - host cordis context (`webServer` + `subprocess` injected).
  * @param {object} [config] - row config
- *   `{ storePath?, baseBranch?, ghPath?, pollMs?, maxRunMs?, maxRuns?, debug? }`.
+ *   `{ storePath?, baseBranch?, ghPath?, skillsRoot?, pollMs?, maxRunMs?, maxRuns?, debug? }`.
  */
 export function apply(ctx, config) {
 	const options = config ?? {};
@@ -501,6 +519,10 @@ export function apply(ctx, config) {
 				: defaultStorePath(),
 		baseBranch: typeof options.baseBranch === "string" ? options.baseBranch : undefined,
 		ghPath: typeof options.ghPath === "string" ? options.ghPath : undefined,
+		skillsRoot:
+			typeof options.skillsRoot === "string" && options.skillsRoot.trim()
+				? resolve(options.skillsRoot.trim())
+				: undefined,
 		pollMs: Number.isFinite(options.pollMs) ? options.pollMs : undefined,
 		maxRunMs: Number.isFinite(options.maxRunMs) ? options.maxRunMs : undefined,
 		maxRuns: Number.isFinite(options.maxRuns) ? options.maxRuns : undefined,

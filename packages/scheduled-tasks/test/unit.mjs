@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeCron, nextCronRun, nextRunAfter, nextRunsAfter, parseCron } from "../lib/cron.js";
 import { createTaskStore, normalizeModel, validateTaskFields } from "../lib/store.js";
+import { normalizeSkillRef, parseSkillDocument } from "../lib/skills.js";
 import {
 	buildScheduledPrompt,
 	extractPrUrl,
@@ -112,9 +113,34 @@ await test("validateTaskFields enforces workspace/cron/prompt contracts", () => 
 	});
 	assert.equal(good.workspace, "/tmp/repo");
 	assert.equal(good.enabled, true, "enabled defaults true");
+	assert.equal(good.skill, null, "skill is optional and defaults to null");
 	assert.throws(() => validateTaskFields({ workspace: "relative/x", cron: "* * * * *", prompt: "x", model: "p/m" }), /absolute/);
 	assert.throws(() => validateTaskFields({ workspace: "/r", cron: "nope", prompt: "x", model: "p/m" }), /cron/i);
 	assert.throws(() => validateTaskFields({ workspace: "/r", cron: "* * * * *", prompt: "   ", model: "p/m" }), /prompt is required/);
+});
+
+await test("validateTaskFields accepts and normalizes an optional skill reference", () => {
+	const base = { workspace: "/r", cron: "* * * * *", prompt: "x", model: "p/m" };
+	assert.deepEqual(validateTaskFields({ ...base, skill: { source: "project", id: "code-review" } }).skill, {
+		source: "project",
+		id: "code-review",
+	});
+	assert.deepEqual(validateTaskFields({ ...base, skill: "profile:find-skills" }).skill, {
+		source: "profile",
+		id: "find-skills",
+	});
+	assert.deepEqual(validateTaskFields({ ...base, skill: null }).skill, null, "explicit null clears the skill");
+	for (const bad of [
+		{ source: "galaxy", id: "x" },
+		{ source: "profile", id: "../escape" },
+		{ source: "profile", id: "a/b" },
+		{ source: "profile", id: "" },
+		"profile:",
+		":thing",
+		"no-colon",
+	]) {
+		assert.throws(() => validateTaskFields({ ...base, skill: bad }), /skill/i, `must reject ${JSON.stringify(bad)}`);
+	}
 });
 
 await test("store persists tasks+runs atomically across reloads and bounds the run tail", async () => {
@@ -201,6 +227,50 @@ await test("scheduled prompts and subjects carry the deterministic contract", ()
 		scheduledCommitSubject("abcd1234", "20260105-103000"),
 		"chore(sched-abcd1234): apply scheduled iteration 20260105-103000",
 	);
+});
+
+await test("buildScheduledPrompt embeds an attached skill between rules and task", () => {
+	const withSkill = buildScheduledPrompt("Do the thing", "/wt", {
+		name: "code-review",
+		body: "# Code Review\nCheck everything.\n",
+	});
+	const skillStart = withSkill.indexOf("[APPLIED SKILL: code-review]");
+	const begin = withSkill.indexOf("----- BEGIN SKILL -----");
+	const end = withSkill.indexOf("----- END SKILL -----");
+	const taskAt = withSkill.indexOf("TASK:");
+	assert.ok(skillStart > -1 && skillStart < begin && begin < end, "skill framing is ordered");
+	assert.match(withSkill, /follow it while performing the TASK/);
+	assert.ok(withSkill.includes("# Code Review\nCheck everything."), "body embedded verbatim");
+	assert.ok(end < taskAt && withSkill.trimEnd().endsWith("Do the thing"), "task stays last");
+	// No skill -> byte-identical to the legacy two-argument form.
+	assert.equal(
+		buildScheduledPrompt("p", "/wt", undefined),
+		buildScheduledPrompt("p", "/wt"),
+	);
+	assert.doesNotMatch(buildScheduledPrompt("p", "/wt"), /APPLIED SKILL/);
+});
+
+await test("parseSkillDocument splits front matter and keeps a verbatim body", () => {
+	const doc = parseSkillDocument(
+		'---\nname: find-skills\ndescription: "Finds installable skills"\n---\n\n# Find Skills\nUse npx skills.',
+	);
+	assert.equal(doc.name, "find-skills");
+	assert.equal(doc.description, "Finds installable skills");
+	assert.equal(doc.body, "\n# Find Skills\nUse npx skills.");
+	const bare = parseSkillDocument("# Just markdown\nno front matter");
+	assert.equal(bare.name, undefined);
+	assert.equal(bare.body, "# Just markdown\nno front matter");
+});
+
+await test("normalizeSkillRef validates sources and single-segment ids", () => {
+	assert.deepEqual(normalizeSkillRef({ source: "profile", id: "x" }), { source: "profile", id: "x" });
+	assert.deepEqual(normalizeSkillRef("project:y"), { source: "project", id: "y" });
+	assert.equal(normalizeSkillRef(undefined), null);
+	assert.equal(normalizeSkillRef(null), null);
+	assert.equal(normalizeSkillRef(""), null);
+	for (const bad of [{ source: "nope", id: "x" }, "../etc", "profile:a/b", "profile:", "profile:..", {}]) {
+		assert.throws(() => normalizeSkillRef(bad), `must reject ${JSON.stringify(bad)}`);
+	}
 });
 
 await test("store survives a crash mid-write thanks to atomic rename", async () => {

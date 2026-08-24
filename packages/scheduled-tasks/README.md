@@ -24,7 +24,8 @@ web surface.
 1. The browser half adds a **"Scheduled Tasks" page to the Settings modal**
    (`settings.section`): a create/edit form — **workspace** (absolute path of
    the target git repository), **model** (provider + model), **cron**
-   (5-field, with a live preview of the next occurrences) and the **prompt**
+   (5-field, with a live preview of the next occurrences), an optional
+   **skill** (selector just above the prompt; see below) and the **prompt**
    injected into the LLM at every firing — above the list of defined tasks
    with their recent runs (status, PR links, notes).
 2. Tasks persist in ONE JSON file under `$DSH_HOME`
@@ -49,6 +50,25 @@ web surface.
 4. Runs are recorded (bounded tail) and visible per task in the settings
    page; `Exécuter` fires a task immediately, `⏻` pauses it without deleting.
 
+### Skills
+
+A task may carry one **skill** — the standard agent-skills unit (a folder
+with a `SKILL.md`, front matter `name` / `description`). The form's selector,
+placed just above the Prompt field, lists two sources:
+
+| Group | Directory |
+| --- | --- |
+| Projet | `<workspace>/.agents/skills/<folder>/SKILL.md` |
+| Profil DSH | `<DSH_HOME>/skills/<folder>/SKILL.md` (default `~/.dsh/skills`) |
+
+At each firing the plugin re-reads the referenced `SKILL.md` from the task's
+ORIGINAL workspace (never the fresh worktree) or from the profile root and
+embeds its body verbatim into the iteration context, framed as
+`[APPLIED SKILL] … ----- BEGIN SKILL -----`. Content is read at firing time,
+so edits to a skill reach subsequent runs without touching the task. A
+missing/unreadable skill never fails a run: it degrades to an explicit run
+note (`skill '…' not loaded …: ran without it`).
+
 Removing the plugin restores the stock Settings exactly; tasks and their
 store file remain on disk until deleted through the API or by hand.
 
@@ -62,6 +82,7 @@ Dual-face cordis plugin, the same shape as every plugin in this repo:
 | Host | `lib/runner.js` | One firing: git plumbing over `ctx.subprocess`, in-process agent iteration, `gh` landing |
 | Host | `lib/cron.js` | Dependency-free 5-field cron parser + next-run math (vixie day-pair semantics) |
 | Host | `lib/store.js` | Atomic JSON persistence (tmp+rename) with validation |
+| Host | `lib/skills.js` | Skill discovery (profile `<DSH_HOME>/skills` + project `.agents/skills`), SKILL.md front-matter parsing, reference validation |
 | Browser | `lib/client.js` | Lazy-CJS factory bundle registering one additive `settings.section` entry |
 
 The web surface serves the bundle automatically: the node half scans Loader
@@ -91,6 +112,7 @@ ln -s /Users/stevemagne/workspace/dsh-plugins/packages/scheduled-tasks \
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `storePath` | `<DSH_HOME>/scheduled-tasks.json` | Where tasks + runs persist |
+| `skillsRoot` | `<DSH_HOME>/skills` | Profile skills directory offered by the form's selector |
 | `baseBranch` | auto (`main` → `master` → `origin/HEAD`) | Force the base branch instead of detecting it |
 | `ghPath` | resolve `gh` on PATH | Explicit GitHub CLI executable |
 | `pollMs` | `15000` | Scheduler tick period (≥ 1000) |
@@ -104,12 +126,13 @@ All endpoints answer JSON under the prefix route:
 
 - `GET  /scheduled-tasks/api/meta` → defaults (current model selection), the chat picker's provider/model catalog as `{providers:[{id,name}], groups:[{provider:{id,name}, models:[{id,name}]}]}` keyed by routable ids, known workspaces, store path
 - `GET  /scheduled-tasks/api/tasks` → task views incl. projected `nextRunAt`
-- `POST /scheduled-tasks/api/tasks` `{workspace, model:{provider,model}|string, cron, prompt, enabled?}` → `201` task
-- `PUT  /scheduled-tasks/api/tasks/:id` → partial update (same fields)
+- `POST /scheduled-tasks/api/tasks` `{workspace, model:{provider,model}|string, cron, prompt, skill?:{source:"profile"|"project",id}|null|string "source:id", enabled?}` → `201` task
+- `PUT  /scheduled-tasks/api/tasks/:id` → partial update (same fields; `skill: null` detaches)
 - `DELETE /scheduled-tasks/api/tasks/:id` → remove the task (runs history stays until pruned)
 - `POST /scheduled-tasks/api/tasks/:id/run` → `202` enqueue one immediate firing
 - `GET  /scheduled-tasks/api/runs[?taskId=]` → recorded runs, newest first
 - `GET  /scheduled-tasks/api/cron-preview?expr=<cron>` → next 3 occurrences + French description, `400` when invalid
+- `GET  /scheduled-tasks/api/skills?workspace=<abs path>` → `{profile:[{source,id,name,description}], project:[…]}` for the form's selector; absent sources degrade to empty groups
 
 Trust posture matches the harness web server itself: loopback bind, no auth,
 plus a Host allowlist (`localhost`/`127.0.0.1`/`[::1]`) against DNS rebinding

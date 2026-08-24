@@ -7,7 +7,8 @@
  *
  *   - `settings.section` — a full "Scheduled Tasks" page inside the Settings
  *     modal: a create/edit form (workspace, model, cron with live preview,
- *     prompt) above the list of defined tasks with their recent runs.
+ *     optional skill context, prompt) above the list of defined tasks with
+ *     their recent runs.
  *
  * The seat is a list slot contributed additively, so unmounting the plugin
  * restores the stock Settings exactly. Externals are limited to the
@@ -147,6 +148,8 @@ window.__ModuleLoader__.load({
 			apiFetch(`/tasks/${encodeURIComponent(id)}/run`, { method: "POST" });
 		const cronPreview = (expr) =>
 			apiFetch(`/cron-preview?expr=${encodeURIComponent(expr)}`, { method: "GET" });
+		const getSkills = (workspace) =>
+			apiFetch(`/skills?workspace=${encodeURIComponent(workspace ?? "")}`, { method: "GET" });
 		//#endregion
 
 		//#region helpers
@@ -188,6 +191,22 @@ window.__ModuleLoader__.load({
 		/** Option label: presentation name with the routable id kept visible. */
 		function optionLabel(row) {
 			return row.name && row.name !== row.id ? `${row.name} (${row.id})` : row.id;
+		}
+
+		/** Wire form of a skill reference: `"source:id"`, or "" for none. */
+		function skillValue(ref) {
+			return ref && ref.source && ref.id ? `${ref.source}:${ref.id}` : "";
+		}
+
+		/** Split the wire form back into the API's `{source, id}` (or null). */
+		function parseSkillValue(value) {
+			const text = String(value ?? "").trim();
+			if (!text) return null;
+			const colon = text.indexOf(":");
+			if (colon <= 0) return null;
+			const source = text.slice(0, colon);
+			const id = text.slice(colon + 1);
+			return source && id ? { source, id } : null;
 		}
 
 		const ACTIVE_STATUSES = ["preparing", "worktree", "running", "landing"];
@@ -248,6 +267,99 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 
+		//#region skill field
+		/**
+		 * Optional skill attached to the task, rendered just above the Prompt.
+		 * One select, two optgroups fed by GET /skills?workspace=… (debounced):
+		 * the edited project's own skills (`.agents/skills`) and the harness
+		 * profile's skills (`<DSH_HOME>/skills`). A stored reference that no
+		 * longer exists stays visible through a fallback option instead of
+		 * being silently rewritten — same contract as the model selects.
+		 */
+		function SkillField({ value, onChange, workspace }) {
+			const [groups, setGroups] = react.useState(null);
+			react.useEffect(() => {
+				let live = true;
+				const timer = window.setTimeout(() => {
+					getSkills(String(workspace ?? "").trim())
+						.then((payload) => {
+							if (live) {
+								setGroups({
+									profile: Array.isArray(payload?.profile) ? payload.profile : [],
+									project: Array.isArray(payload?.project) ? payload.project : [],
+								});
+							}
+						})
+						.catch(() => {
+							if (live) setGroups({ profile: [], project: [] });
+						});
+				}, 250);
+				return () => {
+					live = false;
+					window.clearTimeout(timer);
+				};
+			}, [workspace]);
+			const projectSkills = groups?.project ?? [];
+			const profileSkills = groups?.profile ?? [];
+			const known = [...projectSkills, ...profileSkills].find((row) => skillValue(row) === value);
+			const fallback =
+				value && value.includes(":") && !known
+					? { source: value.slice(0, value.indexOf(":")), id: value.slice(value.indexOf(":") + 1), description: "" }
+					: null;
+			const selected = known ?? fallback;
+			const option = (row) =>
+				react_jsx_runtime.jsx(
+					"option",
+					{
+						value: skillValue(row),
+						title: row.description || "",
+						children: row.name && row.name !== row.id ? `${row.name} (${row.id})` : row.id,
+					},
+					skillValue(row),
+				);
+			return react_jsx_runtime.jsxs("div", {
+				className: "stq-field stq-skill",
+				children: [
+					react_jsx_runtime.jsx("label", { children: "Skill (fournie en contexte à chaque déclenchement)" }),
+					react_jsx_runtime.jsxs("select", {
+						value,
+						onChange: (event) => onChange(event.target.value),
+						children: [
+							react_jsx_runtime.jsx("option", { value: "", children: "— Aucune —" }, "none"),
+							projectSkills.length > 0
+								? react_jsx_runtime.jsx(
+										"optgroup",
+										{ label: "Projet (.agents/skills)", children: projectSkills.map(option) },
+										"project",
+									)
+								: null,
+							profileSkills.length > 0
+								? react_jsx_runtime.jsx(
+										"optgroup",
+										{ label: "Profil DSH (~/.dsh/skills)", children: profileSkills.map(option) },
+										"profile",
+									)
+								: null,
+							fallback
+								? react_jsx_runtime.jsx(
+										"option",
+										{ value, children: `${fallback.id} (introuvable)` },
+										"missing",
+									)
+								: null,
+						].filter(Boolean),
+					}),
+					react_jsx_runtime.jsx("div", {
+						className: "stq-hint",
+						children: selected
+							? selected.description || `skill ${selected.source}:${selected.id}`
+							: "Contexte additionnel lu à chaque exécution : skills du projet (.agents/skills) ou du profil DSH.",
+					}),
+				],
+			});
+		}
+		//#endregion
+
 		//#region task form
 		function TaskForm({ initial, meta, onCancel, onSaved }) {
 			const [workspace, setWorkspace] = react.useState(initial?.workspace ?? "");
@@ -255,6 +367,7 @@ window.__ModuleLoader__.load({
 			const [provider, setProvider] = react.useState(initial?.model?.provider ?? "");
 			const [modelName, setModelName] = react.useState(initial?.model?.model ?? "");
 			const [prompt, setPrompt] = react.useState(initial?.prompt ?? "");
+			const [skill, setSkill] = react.useState(skillValue(initial?.skill));
 			const [enabled, setEnabled] = react.useState(initial ? initial.enabled !== false : true);
 			const [error, setError] = react.useState("");
 			const [saving, setSaving] = react.useState(false);
@@ -302,6 +415,7 @@ window.__ModuleLoader__.load({
 					cron: cron.trim(),
 					model: { provider: effProvider.trim(), model: effModel.trim() },
 					prompt,
+					skill: parseSkillValue(skill),
 					enabled,
 				};
 				const request = initial?.id ? updateTask(initial.id, body) : createTask(body);
@@ -413,6 +527,11 @@ window.__ModuleLoader__.load({
 						],
 					}),
 					react_jsx_runtime.jsx(CronField, { value: cron, onChange: setCron }),
+					react_jsx_runtime.jsx(SkillField, {
+						value: skill,
+						onChange: setSkill,
+						workspace: workspace,
+					}),
 					react_jsx_runtime.jsxs("div", {
 						className: "stq-field",
 						children: [
@@ -511,6 +630,13 @@ window.__ModuleLoader__.load({
 								children: workspaceLabel(task.workspace),
 							}),
 							react_jsx_runtime.jsx("span", { className: "stq-model", children: modelLabel(task) }),
+							task.skill
+								? react_jsx_runtime.jsx("span", {
+										className: "stq-model",
+										title: `skill ${task.skill.source}:${task.skill.id}`,
+										children: `◆ ${task.skill.id}`,
+									})
+								: null,
 							react_jsx_runtime.jsx("div", {
 								className: "stq-actions",
 								children: react_jsx_runtime.jsxs(react.Fragment, {

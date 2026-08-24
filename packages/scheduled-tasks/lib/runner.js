@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { SKILL_FILE } from "./skills.js";
 
 export const TERMINAL_RUN_STATUSES = new Set(["done", "error"]);
 export const WORKTREE_DIR_PARTS = [".dsh", "worktrees"];
@@ -49,10 +50,11 @@ function tail(text, maxChars) {
 
 /**
  * The framing wrapped around the user's prompt for every scheduled run:
- * unattended execution rules + the verbatim task.
+ * unattended execution rules, the optional attached skill (injected as
+ * verbatim context the agent must follow), then the verbatim task.
  */
-export function buildScheduledPrompt(taskPrompt, worktreePath) {
-	return [
+export function buildScheduledPrompt(taskPrompt, worktreePath, skill) {
+	const lines = [
 		"[SCHEDULED TASK]",
 		"This iteration runs unattended: nobody will answer questions, so make reasonable decisions and carry on.",
 		`Work ONLY inside this session's working directory (${worktreePath}) — an isolated git worktree based on up-to-date main.`,
@@ -60,10 +62,19 @@ export function buildScheduledPrompt(taskPrompt, worktreePath) {
 		"- stage and commit ALL the changes you produced with clear conventional-commit message(s) on the current branch;",
 		"- do NOT push, do NOT open a pull request, do NOT modify the original checkout;",
 		"- finish with a short summary of what you did and what you deliberately left out.",
-		"",
-		"TASK:",
-		String(taskPrompt ?? "").trim(),
-	].join("\n");
+	];
+	if (skill && typeof skill.body === "string" && skill.body.trim()) {
+		lines.push(
+			"",
+			`[APPLIED SKILL${skill.name ? `: ${skill.name}` : ""}]`,
+			"The scheduled task carries this skill as additional instructions: read it first and follow it while performing the TASK below.",
+			"----- BEGIN SKILL -----",
+			skill.body.trim(),
+			"----- END SKILL -----",
+		);
+	}
+	lines.push("", "TASK:", String(taskPrompt ?? "").trim());
+	return lines.join("\n");
 }
 
 /** Deterministic commit/PR title for the landing phase. */
@@ -127,6 +138,9 @@ export function summarizeInterval(events, firstSeq) {
  * @param {{create?: Function}} [deps.agents] - optional ctx.agents service.
  * @param {{flush?: Function}} [deps.sessions] - optional ctx.sessions service.
  * @param {(record: object) => Promise<void>} [deps.recordRun] - progress sink.
+ * @param {(task: object) => Promise<{name?: string, body: string}|undefined>} [deps.readSkill]
+ *   resolves a task's stored skill reference into its SKILL.md document at
+ *   firing time; a rejection degrades to a run note, never a failed run.
  * @param {string} [deps.baseBranch] - force the base branch (default main/master detection).
  * @param {string} [deps.ghPath] - explicit gh executable.
  * @param {number} [deps.maxRunMs] - whole-iteration budget before teardown.
@@ -142,6 +156,7 @@ export function createScheduledRunner(deps) {
 	const sessions =
 		deps.sessions && typeof deps.sessions.flush === "function" ? deps.sessions : undefined;
 	const recordRun = typeof deps.recordRun === "function" ? deps.recordRun : async () => {};
+	const readSkill = typeof deps.readSkill === "function" ? deps.readSkill : undefined;
 	const warn = typeof deps.warn === "function" ? deps.warn : () => {};
 	const now = typeof deps.now === "function" ? deps.now : Date.now;
 	const scheduleTimeout =
@@ -453,7 +468,7 @@ export function createScheduledRunner(deps) {
 		return false;
 	}
 
-	async function runIteration(record, task, worktreePath) {
+	async function runIteration(record, task, worktreePath, skill) {
 		if (!agents) throw new Error("the harness 'agents' service is unavailable in this composition");
 		record.status = "running";
 		await recordRun(snapshot(record));
@@ -491,7 +506,7 @@ export function createScheduledRunner(deps) {
 			agent.followup({
 				id: randomUUID(),
 				role: "user",
-				content: [{ type: "text", text: buildScheduledPrompt(task.prompt, worktreePath) }],
+				content: [{ type: "text", text: buildScheduledPrompt(task.prompt, worktreePath, skill) }],
 				source: { kind: "plugin", plugin: "@dsh-plugins/scheduled-tasks" },
 			});
 			await agent.whenIdle();
@@ -672,7 +687,10 @@ export function createScheduledRunner(deps) {
 		await recordRun(snapshot(record));
 		try {
 			const prepared = await prepareWorktree(record, task);
-			const iteration = await runIteration(record, task, prepared.worktreePath);
+			const { skill, skillNote } = await loadSkillContext(task);
+			if (skill) record.skillApplied = `${task.skill.source}:${task.skill.id}`;
+			if (skillNote) record.skillNote = skillNote;
+			const iteration = await runIteration(record, task, prepared.worktreePath, skill);
 			await landPr(record, task, prepared, iteration);
 			record.status = "done";
 			record.finishedAt = now();
@@ -682,8 +700,38 @@ export function createScheduledRunner(deps) {
 			record.finishedAt = now();
 			warn(`scheduled-tasks: run ${record.id} failed: ${record.error}`);
 		}
+		if (record.skillNote || record.skillApplied) {
+			record.note = [
+				record.note,
+				record.skillNote ?? `skill '${record.skillApplied}' applied`,
+			]
+				.filter(Boolean)
+				.join("; ");
+		}
+		delete record.skillNote;
+		delete record.skillApplied;
 		await recordRun(snapshot(record));
 		return snapshot(record);
+	}
+
+	/**
+	 * Resolve a task's stored skill into its SKILL.md document at firing
+	 * time. A missing/unreadable skill degrades to an explicit note and the
+	 * run proceeds WITHOUT it — scheduling must not break because a folder
+	 * moved; the note keeps the omission visible in the run history.
+	 */
+	async function loadSkillContext(task) {
+		if (!task.skill || !readSkill) return { skill: undefined, skillNote: undefined };
+		const label = `${task.skill.source}:${task.skill.id}`;
+		try {
+			const document = await readSkill(task);
+			if (!document?.body?.trim()) throw new Error(`${SKILL_FILE} is empty or missing`);
+			return { skill: document, skillNote: undefined };
+		} catch (error) {
+			const reason = oneLine(error?.message ?? error).slice(0, 200);
+			warn(`scheduled-tasks: skill '${label}' not loaded (${reason}); running without it`);
+			return { skill: undefined, skillNote: `skill '${label}' not loaded (${reason}): ran without it` };
+		}
 	}
 
 	async function quiesce() {

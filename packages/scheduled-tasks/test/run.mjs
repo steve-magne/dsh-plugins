@@ -10,8 +10,8 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, realpathSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmodSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createScheduledTasks } from "../lib/index.js";
@@ -56,6 +56,15 @@ async function makeProject() {
 	writeFileSync(join(root, "README.md"), "# fixture\n", "utf8");
 	git(["add", "."], root);
 	git(["commit", "-q", "-m", "seed"], root);
+	// A project-level skill, deliberately left UNCOMMITTED: it exists in the
+	// original checkout only, pinning the contract that firings read skills
+	// from the task's workspace — never from the fresh worktree.
+	mkdirSync(join(root, ".agents", "skills", "review"), { recursive: true });
+	writeFileSync(
+		join(root, ".agents", "skills", "review", "SKILL.md"),
+		'---\nname: review\ndescription: "Review the code carefully."\n---\nALWAYS review the full diff before committing.\n',
+		"utf8",
+	);
 	git(["push", "-q", "-u", "origin", "main"], root);
 	return {
 		dir,
@@ -296,7 +305,16 @@ async function ghPathFor(mode) {
 	return ghPaths[mode];
 }
 
-async function buildController({ agents, sessions, ghMode, llm } = {}) {
+/** Fake DSH profile skills root: `<DSH_HOME>/skills` with one skill. */
+const profileSkillsRoot = join(scratchRoot, "dsh-home", "skills");
+await mkdir(join(profileSkillsRoot, "profile-skill"), { recursive: true });
+await writeFile(
+	join(profileSkillsRoot, "profile-skill", "SKILL.md"),
+	"---\nname: profile-skill\ndescription: Skill living in the DSH profile.\n---\nPROFILE SKILL BODY v1\n",
+	"utf8",
+);
+
+async function buildController({ agents, sessions, ghMode, llm, skillsRoot } = {}) {
 	return createScheduledTasks({
 		spawn: spawnStub,
 		resolveExecutable: async (command) => (command === "gh" ? ghPathFor(ghMode) : command),
@@ -305,6 +323,7 @@ async function buildController({ agents, sessions, ghMode, llm } = {}) {
 		llm,
 		defaultModel: () => ({ provider: "deepseek", model: "stub-model" }),
 		storePath: join(scratchRoot, `store-${Math.random().toString(36).slice(2)}.json`),
+		skillsRoot: skillsRoot ?? profileSkillsRoot,
 		pollMs: 60_000, // the scheduler is driven manually through tick()
 		maxRunMs: 180_000,
 		warn: () => {},
@@ -430,6 +449,129 @@ await test("task CRUD validates input; cron preview reports next occurrences", a
 	assert.equal(removed.status, 200);
 	const gone = await call(controller, { method: "DELETE", url: `${API}/tasks/${taskId}` });
 	assert.equal(gone.status, 404);
+});
+
+await test("/skills feeds the form selector from the project and the profile", async () => {
+	const project = await makeProject();
+	const controller = await buildController();
+
+	const listed = await call(controller, {
+		method: "GET",
+		url: `${API}/skills?workspace=${encodeURIComponent(project.root)}`,
+	});
+	assert.equal(listed.status, 200);
+	assert.deepEqual(
+		listed.payload.project.map((skill) => `${skill.source}:${skill.id}`),
+		["project:review"],
+	);
+	assert.equal(listed.payload.project[0].name, "review");
+	assert.match(listed.payload.project[0].description, /Review the code/);
+	assert.deepEqual(
+		listed.payload.profile.map((skill) => `${skill.source}:${skill.id}`),
+		["profile:profile-skill"],
+	);
+	assert.match(listed.payload.profile[0].description, /DSH profile/);
+
+	// Without (or with a relative) workspace: profile only, never an error.
+	for (const query of ["", `?workspace=relative/path`]) {
+		const bare = await call(controller, { method: "GET", url: `${API}/skills${query}` });
+		assert.equal(bare.status, 200);
+		assert.deepEqual(bare.payload.project, []);
+		assert.equal(bare.payload.profile.length, 1);
+	}
+
+	await project.cleanup();
+});
+
+await test("an attached skill is re-read at firing time and injected as context", async () => {
+	const project = await makeProject();
+	const agents = makeAgentsStub(true);
+	const sessions = makeSessionsStub();
+	const controller = await buildController({ agents, sessions });
+
+	const created = await call(controller, {
+		method: "POST",
+		url: `${API}/tasks`,
+		body: {
+			workspace: project.root,
+			cron: "0 0 31 12 *",
+			prompt: "Harden the parser",
+			model: { provider: "deepseek", model: "stub-model" },
+			skill: { source: "project", id: "review" },
+		},
+	});
+	assert.equal(created.status, 201);
+	assert.deepEqual(created.payload.skill, { source: "project", id: "review" }, "the stored view echoes the skill");
+	const taskId = created.payload.id;
+
+	// Editing the skill between creation and firing must reach the NEXT run:
+	// content is read at firing time, never cached in the task.
+	await writeFile(
+		join(project.root, ".agents", "skills", "review", "SKILL.md"),
+		"---\nname: review\ndescription: updated\n---\nREVISED REVIEW CHECKLIST v2\n",
+		"utf8",
+	);
+
+	const fired = await call(controller, { method: "POST", url: `${API}/tasks/${taskId}/run` });
+	assert.equal(fired.status, 202);
+	const runs = await waitFor(async () => {
+		const listing = await call(controller, { method: "GET", url: `${API}/runs?taskId=${taskId}` });
+		const run = listing.payload.runs[0];
+		return run && ["done", "error"].includes(run.status) ? listing.payload.runs : undefined;
+	}, "terminal run status");
+	assert.equal(runs[0].status, "done", runs[0].error ?? "");
+
+	const promptText = agents.creations[0].promptText;
+	assert.match(promptText, /\[APPLIED SKILL: review\]/);
+	assert.ok(promptText.includes("REVISED REVIEW CHECKLIST v2"), "firing-time content is embedded verbatim");
+	assert.ok(promptText.indexOf("[APPLIED SKILL") < promptText.indexOf("TASK:"), "skill precedes the task");
+	assert.match(runs[0].note ?? "", /skill 'project:review' applied/);
+
+	await call(controller, { method: "DELETE", url: `${API}/tasks/${taskId}` });
+	await project.cleanup();
+});
+
+await test("a vanished skill degrades to a note and never fails the run", async () => {
+	const project = await makeProject();
+	const agents = makeAgentsStub(true);
+	const controller = await buildController({ agents });
+
+	// The store validates the reference's SHAPE, not its existence on disk.
+	const created = await call(controller, {
+		method: "POST",
+		url: `${API}/tasks`,
+		body: {
+			workspace: project.root,
+			cron: "@daily",
+			prompt: "still runs",
+			model: "deepseek/stub-model",
+			skill: "profile:ghost-skill",
+		},
+	});
+	assert.equal(created.status, 201);
+	const taskId = created.payload.id;
+	await call(controller, { method: "POST", url: `${API}/tasks/${taskId}/run` });
+
+	const runs = await waitFor(async () => {
+		const listing = await call(controller, { method: "GET", url: `${API}/runs?taskId=${taskId}` });
+		const run = listing.payload.runs[0];
+		return run && ["done", "error"].includes(run.status) ? listing.payload.runs : undefined;
+	}, "terminal run status");
+	assert.equal(runs[0].status, "done", runs[0].error ?? "");
+	assert.doesNotMatch(agents.creations[0].promptText ?? "", /APPLIED SKILL/, "no phantom context is injected");
+	assert.match(runs[0].note ?? "", /skill 'profile:ghost-skill' not loaded.*ran without it/);
+
+	// Clearing the skill via PUT removes it from the stored view too.
+	const cleared = await call(controller, {
+		method: "PUT",
+		url: `${API}/tasks/${taskId}`,
+		body: { skill: null },
+	});
+	assert.equal(cleared.status, 200);
+	assert.equal(cleared.payload.skill, null);
+
+	await call(controller, { method: "DELETE", url: `${API}/tasks/${taskId}` });
+	await project.cleanup();
 });
 
 await test("run-now: worktree from up-to-date main, pinned-model iteration, push + PR", async () => {
