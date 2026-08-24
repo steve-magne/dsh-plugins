@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { nextRunAfter } from "./cron.js";
+import { normalizeSkillRef } from "./skills.js";
 
 export const STORE_VERSION = 1;
 export const MAX_PROMPT_CHARS = 20_000;
@@ -80,11 +81,15 @@ export function validateTaskFields(input, options = {}) {
 	if (prompt.length > MAX_PROMPT_CHARS) {
 		throw storeError(400, `prompt exceeds ${MAX_PROMPT_CHARS} characters`);
 	}
+	// Optional skill context: null when absent, `{source,id}` otherwise
+	// (ids are validated folder names — see normalizeSkillRef).
+	const skill = normalizeSkillRef(input.skill);
 	return {
 		workspace: resolve(workspaceRaw),
 		model,
 		cron,
 		prompt,
+		skill,
 		enabled: input.enabled === undefined ? true : Boolean(input.enabled),
 	};
 }
@@ -96,6 +101,7 @@ function publicTask(task) {
 		model: { ...task.model },
 		cron: task.cron,
 		prompt: task.prompt,
+		skill: task.skill ? { ...task.skill } : null,
 		enabled: task.enabled,
 		createdAt: task.createdAt,
 		updatedAt: task.updatedAt,
@@ -223,6 +229,7 @@ export function createTaskStore(deps) {
 						: existing.model,
 			cron: patch.cron !== undefined ? patch.cron : existing.cron,
 			prompt: patch.prompt !== undefined ? patch.prompt : existing.prompt,
+			skill: patch.skill !== undefined ? patch.skill : (existing.skill ?? null),
 			enabled: patch.enabled !== undefined ? Boolean(patch.enabled) : existing.enabled,
 		};
 		const fields = validateTaskFields(merged, options);
