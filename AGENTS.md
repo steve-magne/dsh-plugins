@@ -25,7 +25,8 @@ Dual-face [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
   "type": "module",
   "exports": {
     ".": "./lib/index.js",              // host half (cordis plugin body)
-    "./client": "./lib/client.js"       // browser half (served as /plugins/<name>/client.js)
+    "./client": "./lib/client.js",      // browser half (served as /plugins/<name>/client.js)
+    "./package.json": "./package.json"  // REQUIRED: see scan note below
   },
   "dsh": { "client": { "platform": "web", "inject": [] } }
 }
@@ -33,7 +34,12 @@ Dual-face [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 The harness's `dsh-client-modules` node half scans active Loader entries for
 `dsh.client` declarations, hashes `exports["./client"]` into
-`window.__DSH_BOOT__`, and serves each bundle. **`dsh.client.inject` lists
+`window.__DSH_BOOT__`, and serves each bundle. The scan resolves
+`require.resolve("<name>/package.json")` and **silently drops the entry** when
+that throws — so `exports` MUST declare `"./package.json"`, otherwise Node
+raises `ERR_PACKAGE_PATH_NOT_EXPORTED` and the host half still runs while the
+browser bundle never mounts (no toggle, 404 on `/plugins/<name>/client.js`).
+**`dsh.client.inject` lists
 module-graph requests (other packages' bundles), not cordis services** — leave
 it empty unless you genuinely need another plugin's client bundle.
 
