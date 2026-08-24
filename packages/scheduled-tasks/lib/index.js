@@ -208,31 +208,55 @@ export function createScheduledTasks(deps) {
 		}
 	}
 
+	/**
+	 * Settings-form metadata. The provider/model lists MIRROR the chat
+	 * window's model picker (`buildModelCatalog` in dsh-host-apiproxy): every
+	 * provider from `llm.listProviders()` keyed by its routable ID, plus one
+	 * model group per provider from `llm.listModels(id)`. Ids are the values
+	 * tasks store and the runner pins; names are presentation only, so a
+	 * display name must never end up where an id belongs (that mismatch made
+	 * `listModels` throw and the form's model list render empty). One failing
+	 * provider degrades to an empty group instead of blanking the whole list.
+	 */
 	async function buildMeta() {
 		const selection = defaultSelection();
 		const providers = [];
 		if (llm && typeof llm.listProviders === "function") {
 			try {
 				for (const entry of await llm.listProviders()) {
-					const name = typeof entry === "string" ? entry : entry?.name ?? entry?.id ?? entry?.provider;
-					if (typeof name === "string" && name && !providers.includes(name)) providers.push(name);
+					const id = typeof entry === "string" ? entry : entry?.id ?? entry?.name;
+					if (typeof id !== "string" || !id || providers.some((row) => row.id === id)) continue;
+					const name =
+						typeof entry === "object" && typeof entry?.name === "string" && entry.name
+							? entry.name
+							: id;
+					providers.push({ id, name });
 				}
 			} catch {
-				/* provider directory unavailable */
+				/* provider directory unavailable: the form degrades to free text */
 			}
 		}
-		let models = [];
-		const providerName = selection?.provider ?? providers[0];
-		if (llm && typeof llm.listModels === "function" && providerName) {
-			try {
-				for (const entry of await llm.listModels(providerName)) {
-					const name = typeof entry === "string" ? entry : entry?.name ?? entry?.model ?? entry?.id;
-					if (typeof name === "string" && name && !models.includes(name)) models.push(name);
+		const groups = await Promise.all(
+			providers.map(async (provider) => {
+				const models = [];
+				if (llm && typeof llm.listModels === "function") {
+					try {
+						for (const entry of await llm.listModels(provider.id)) {
+							const id = typeof entry === "string" ? entry : entry?.id ?? entry?.name;
+							if (typeof id !== "string" || !id || models.some((row) => row.id === id)) continue;
+							const name =
+								typeof entry === "object" && typeof entry?.name === "string" && entry.name
+									? entry.name
+									: id;
+							models.push({ id, name });
+						}
+					} catch {
+						/* this provider's catalog is unreadable; keep its group empty */
+					}
 				}
-			} catch {
-				models = [];
-			}
-		}
+				return { provider, models };
+			}),
+		);
 		const workspaces = [];
 		try {
 			for (const workspace of listWorkspaces()) {
@@ -250,8 +274,7 @@ export function createScheduledTasks(deps) {
 		return {
 			defaults: selection ? { provider: selection.provider, model: selection.model } : null,
 			providers,
-			models,
-			defaultProvider: selection?.provider ?? providers[0] ?? null,
+			groups: groups.filter((group) => group.models.length > 0),
 			workspaces,
 			storePath: deps.storePath,
 		};

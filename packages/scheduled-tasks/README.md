@@ -102,7 +102,7 @@ ln -s /Users/stevemagne/workspace/dsh-plugins/packages/scheduled-tasks \
 
 All endpoints answer JSON under the prefix route:
 
-- `GET  /scheduled-tasks/api/meta` → defaults (current model selection), providers/models, known workspaces, store path
+- `GET  /scheduled-tasks/api/meta` → defaults (current model selection), the chat picker's provider/model catalog as `{providers:[{id,name}], groups:[{provider:{id,name}, models:[{id,name}]}]}` keyed by routable ids, known workspaces, store path
 - `GET  /scheduled-tasks/api/tasks` → task views incl. projected `nextRunAt`
 - `POST /scheduled-tasks/api/tasks` `{workspace, model:{provider,model}|string, cron, prompt, enabled?}` → `201` task
 - `PUT  /scheduled-tasks/api/tasks/:id` → partial update (same fields)

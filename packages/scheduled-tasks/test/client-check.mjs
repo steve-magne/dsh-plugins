@@ -136,9 +136,16 @@ assert.ok(rendered.includes("Aucune tâche planifiée"), "empty state invites cr
 
 assert.ok(sandbox.appendedStyle, "bundle must inject its stylesheet at materialization");
 assert.match(sandbox.appendedStyle.textContent, /\.stq-root\{/);
+// Native control popups (select dropdowns, datalist suggestions) follow the
+// used color-scheme; the app never declares one page-wide, so the form opts
+// its own subtree in per active theme — otherwise popup text renders dark on
+// this dark UI (unreadable).
+const css = sandbox.appendedStyle.textContent;
+assert.match(css, /\.stq-root\{color-scheme:light;/);
+assert.match(css, /body\[data-ds-dark-theme\] \.stq-root\{color-scheme:dark\}/);
 
 console.log("client-bundle contract OK:");
 console.log("  - registers under id @dsh-plugins/scheduled-tasks");
 console.log("  - injects 'settings.section' as entry 'scheduled-tasks' labeled 'Scheduled Tasks'");
 console.log("  - page smoke-renders with create button + empty state");
-console.log("  - stylesheet injected at materialization");
+console.log("  - stylesheet injected at materialization, themed color-scheme for native popups");
