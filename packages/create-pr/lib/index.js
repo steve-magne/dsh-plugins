@@ -11,10 +11,17 @@
  *       1. resolve the repo (session cwd -> row config `cwd`), refuse the base
  *          branch and non-GitHub origins;
  *       2. stage + commit uncommitted work — the conventional-commit message
- *          is the ONLY LLM call of the whole flow (`ctx.llm` one-shot, strict
- *          parse, deterministic fallback when the service is absent);
+ *          is an LLM call (`ctx.llm` one-shot, strict parse, deterministic
+ *          fallback when the service is absent);
  *       3. push the branch and `gh pr create` (adopting an existing PR for
- *          the branch instead of failing);
+ *          the branch instead of failing). The PR text is its own artifact,
+ *          never the raw commit message: the title is a second LLM one-shot
+ *          over the WHOLE branch delta (commit subjects + `git diff --stat`
+ *          + truncated diff vs the merge base), and the body is assembled
+ *          deterministically in the Claude Code / Codex shape — `## Summary`
+ *          (LLM bullets or commit-subject fallback), `## Changes` (exact
+ *          per-file +/- evidence from the stat digest, zero tokens) and
+ *          `## Commits`;
  *   - a CI WATCHDOG hook then polls `gh pr view --json statusCheckRollup`
  *     on a timer until the checks settle. On failure it fetches the failed
  *     steps' logs (`gh run list` + `gh run view --log-failed`), and wakes the
@@ -54,6 +61,7 @@ const DEFAULT_MAX_WATCH_MS = 30 * 60_000;
 const DIFF_MAX_CHARS = 12_000;
 const LOG_TAIL_CHARS = 12_000;
 const COMMIT_MAX_TOKENS = 350;
+const PR_MAX_TOKENS = 500;
 
 const BASE_BRANCHES = new Set(["main", "master"]);
 
@@ -188,41 +196,207 @@ export function parseConventionalMessage(text) {
 	return { subject: subject.slice(0, 200), body: body.slice(0, 4_000) };
 }
 
+/** Section caps of the generated PR body — keeps `gh pr create --body` sane. */
+const MAX_BODY_FILES = 40;
+const MAX_BODY_COMMITS = 20;
+
+/**
+ * Parse `git diff --stat` output into per-file entries
+ * `{path, insertions, deletions, binary}`. Insertion/deletion counts are read
+ * from the +/- glyph bar (a scaled bar is approximate by design); binary files
+ * (`img.png | Bin 0 -> 123 bytes`) report `{binary: true}`. The trailing
+ * "N files changed…" summary line has no `|` column and never matches.
+ */
+export function parseStatEntries(statText) {
+	const entries = [];
+	for (const line of String(statText ?? "").split("\n")) {
+		const text = line.replace(/\r$/, "");
+		if (!text.trim()) continue;
+		const pipeAt = text.indexOf("|");
+		const graph = pipeAt >= 0 ? text.slice(pipeAt).match(/^\|\s+(\d+)\s*([+-]*)$/) : null;
+		if (graph) {
+			entries.push({
+				path: text.slice(0, pipeAt).trim(),
+				insertions: (graph[2].match(/\+/g) ?? []).length,
+				deletions: (graph[2].match(/-/g) ?? []).length,
+				binary: false,
+			});
+			continue;
+		}
+		const binary = text.match(/^\s*(.+?)\s+\|\s+Bin\b/);
+		if (binary) {
+			entries.push({ path: binary[1].trim(), insertions: 0, deletions: 0, binary: true });
+		}
+	}
+	return entries;
+}
+
+function formatStatEntry(entry) {
+	if (entry.binary) return `${entry.path} (binary)`;
+	const parts = [];
+	if (entry.insertions > 0) parts.push(`+${entry.insertions}`);
+	if (entry.deletions > 0) parts.push(`-${entry.deletions}`);
+	return `${entry.path} (${parts.join(" ") || "no line change"})`;
+}
+
+function cleanSubjects(commitSubjects) {
+	return (Array.isArray(commitSubjects) ? commitSubjects : [])
+		.map((subject) => String(subject ?? "").trim())
+		.filter(Boolean);
+}
+
+/**
+ * Assemble the deterministic skeleton of the PR conversation body — the
+ * Claude Code / Codex shape: a summary (LLM or fallback) followed by the exact
+ * impacted files and the branch's commit subjects. The file/action evidence is
+ * pure `git diff --stat` shaping and costs zero tokens.
+ */
+export function buildPrBody({ summary, statText, commitSubjects } = {}) {
+	const trimmedSummary = String(summary ?? "").trim();
+	const sections = ["## Summary", trimmedSummary || "_No summary available._"];
+	const entries = parseStatEntries(statText);
+	if (entries.length > 0) {
+		sections.push("", "## Changes");
+		for (const entry of entries.slice(0, MAX_BODY_FILES)) {
+			sections.push(`- ${formatStatEntry(entry)}`);
+		}
+		if (entries.length > MAX_BODY_FILES) {
+			sections.push(`- …and ${entries.length - MAX_BODY_FILES} more changed files`);
+		}
+	}
+	const subjects = cleanSubjects(commitSubjects);
+	if (subjects.length > 0) {
+		sections.push("", "## Commits");
+		for (const subject of subjects.slice(0, MAX_BODY_COMMITS)) {
+			sections.push(`- ${subject}`);
+		}
+		if (subjects.length > MAX_BODY_COMMITS) {
+			sections.push(`- …and ${subjects.length - MAX_BODY_COMMITS} more commits`);
+		}
+	}
+	return sections.join("\n");
+}
+
+const TYPE_PRIORITY = [
+	"feat",
+	"fix",
+	"perf",
+	"refactor",
+	"docs",
+	"test",
+	"build",
+	"ci",
+	"style",
+	"chore",
+	"revert",
+];
+
+function dominantConventionalType(subjects) {
+	const counts = new Map();
+	for (const subject of subjects) {
+		const match = String(subject).match(
+			/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(|:)/i,
+		);
+		if (!match) continue;
+		const type = match[1].toLowerCase();
+		counts.set(type, (counts.get(type) ?? 0) + 1);
+	}
+	for (const type of TYPE_PRIORITY) {
+		if (counts.get(type)) return type;
+	}
+	return undefined;
+}
+
+/** The commit scope only becomes the PR scope when EVERY commit agrees on it. */
+function sharedScope(subjects) {
+	let scope;
+	for (const subject of subjects) {
+		const match = String(subject).match(/^[a-z]+\(([^)]+)\)/i);
+		if (!match) return undefined;
+		if (scope === undefined) scope = match[1];
+		else if (scope !== match[1]) return undefined;
+	}
+	return scope;
+}
+
+function inferTypeFromPaths(paths) {
+	if (paths.length === 0) return undefined;
+	if (paths.every((f) => /\.md$|\.txt$|^docs\//i.test(f))) return "docs";
+	if (
+		paths.every(
+			(f) => /(^|\/)(tests?|__tests__)\//i.test(f) || /\.(test|spec)\.[jt]sx?$/i.test(f),
+		)
+	) {
+		return "test";
+	}
+	return undefined;
+}
+
+function plural(count, unit) {
+	return `${count} ${unit}${count === 1 ? "" : "s"}`;
+}
+
+function fileSummaryBullets(subjects) {
+	if (subjects.length === 0) return "_No summary available._";
+	const lines = subjects.slice(0, 10).map((subject) => `- ${subject}`);
+	if (subjects.length > 10) lines.push(`- …and ${subjects.length - 10} more commits`);
+	return lines.join("\n");
+}
+
 /**
  * Deterministic fallback message (used when no `llm` service answered with a
  * valid conventional subject). Pure string shaping over file paths / commit
- * counts — zero tokens.
+ * subjects — zero tokens. In `pr` mode the title reuses a single conventional
+ * commit subject verbatim when there is exactly one, otherwise it derives the
+ * dominant type/scope from the branch commits ("feat(api): land 2 commits
+ * across 5 files"). The returned body is only the free-text part; the caller
+ * wraps it with {@link buildPrBody} for the structured sections.
  */
-export function deterministicFallbackMessage({ mode, statText }) {
-	if (mode === "pr") {
-		const count = String(statText ?? "").split("---").filter((part) => part.trim()).length;
+export function deterministicFallbackMessage({ mode, statText, commitSubjects } = {}) {
+	const entries = parseStatEntries(statText);
+	const paths = [...new Set(entries.map((entry) => entry.path))];
+	const subjects = cleanSubjects(commitSubjects);
+	if (mode !== "pr") {
+		const allDocs = paths.length > 0 && paths.every((f) => /\.md$|\.txt$|^docs\//i.test(f));
+		const allTests =
+			paths.length > 0 &&
+			paths.every(
+				(f) => /(^|\/)(tests?|__tests__)\//i.test(f) || /\.(test|spec)\.[jt]sx?$/i.test(f),
+			);
+		const type = allDocs ? "docs" : allTests ? "test" : "chore";
+		const dirs = [
+			...new Set(paths.map((f) => f.split("/")[0]).filter((d) => d && d !== "." && d !== "..")),
+		].slice(0, 3);
+		const scope = dirs.length > 0 ? ` (${dirs.join(", ")})` : "";
+		const body = paths
+			.slice(0, 8)
+			.map((path) => `- ${path}`)
+			.concat(paths.length > 8 ? [`- …and ${paths.length - 8} more files`] : [])
+			.join("\n");
 		return {
-			subject: `chore: land ${Math.max(count, 1)} commit${count > 1 ? "s" : ""}`,
-			body: "",
+			subject: `${type}: update ${plural(paths.length || 1, "file")}${scope}`,
+			body,
 		};
 	}
-	const files = String(statText ?? "")
-		.split("\n")
-		.map((line) => line.split("|")[0].trim())
-		.filter((line) => line.length > 0 && !line.includes("changed"));
-	const unique = [...new Set(files)];
-	const allDocs = unique.length > 0 && unique.every((f) => /\.md$|\.txt$|^docs\//i.test(f));
-	const allTests =
-		unique.length > 0 &&
-		unique.every((f) => /(^|\/)(tests?|__tests__)\//i.test(f) || /\.(test|spec)\.[jt]sx?$/i.test(f));
-	const type = allDocs ? "docs" : allTests ? "test" : "chore";
-	const dirs = [
-		...new Set(
-			unique
-				.map((f) => f.split("/")[0])
-				.filter((d) => d && d !== "." && d !== ".."),
-		),
-	].slice(0, 3);
-	const scope = dirs.length > 0 ? ` (${dirs.join(", ")})` : "";
-	return {
-		subject: `${type}: update ${unique.length || 1} file${unique.length > 1 ? "s" : ""}${scope}`,
-		body: "",
-	};
+	// pr mode: a single conventional commit IS the honest PR title.
+	if (subjects.length === 1 && CONVENTIONAL_SUBJECT_RE.test(subjects[0])) {
+		return { subject: subjects[0].slice(0, 200), body: "" };
+	}
+	const type =
+		dominantConventionalType(subjects) ??
+		inferTypeFromPaths(paths) ??
+		"chore";
+	const scope = sharedScope(subjects);
+	const scopePart = scope ? `(${scope})` : "";
+	let description;
+	if (subjects.length > 1) {
+		description = `land ${plural(subjects.length, "commit")} across ${plural(entries.length, "file")}`;
+	} else if (entries.length > 0) {
+		description = `update ${plural(entries.length, "file")}`;
+	} else {
+		description = "open pull request for this branch";
+	}
+	return { subject: `${type}${scopePart}: ${description}`.slice(0, 200), body: "" };
 }
 
 /** Pull the first GitHub PR URL (+number) out of gh stdout/stderr text. */
@@ -455,37 +629,15 @@ export function createPrLauncher(deps) {
 	// ------------------------------------------------------- commit messaging
 
 	/**
-	 * The single LLM call of the pipeline: turn a diff/commit-log digest into a
-	 * conventional-commit `{subject, body}`. Any absence, transport failure, or
-	 * off-format answer degrades to {@link deterministicFallbackMessage}.
+	 * One bounded LLM round-trip. Returns the raw text, or undefined when no
+	 * `llm` service is wired, no model is selected, the transport fails, or the
+	 * stream ends abnormally — every caller degrades to its deterministic
+	 * fallback in that case.
 	 */
-	async function composeMessage({ mode, statText, diffText }) {
-		const fallback = deterministicFallbackMessage({
-			mode: mode === "pr" ? "pr" : "commit",
-			statText,
-		});
-		if (!llm) return fallback;
+	async function askModel(parts, maxTokens) {
+		if (!llm) return undefined;
 		const selection = modelSelection();
-		if (!selection?.provider || !selection?.model) return fallback;
-		const ask =
-			mode === "pr"
-				? [
-						"Commits about to be opened as one GitHub pull request:",
-						statText,
-						"",
-						"Write ONE conventional-commit style title (feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert, optional scope, ': ', imperative description) summarizing the whole change set, then a blank line, then at most 3 short body bullets.",
-				  ]
-				: [
-						"Staged change about to be committed:",
-						"",
-						"File stats:",
-						statText,
-						"",
-						"Diff (truncated):",
-						diffText,
-						"",
-						"Write ONE conventional-commit message (type(scope)?: imperative description) summarizing this implementation, then a blank line, then at most 3 short body bullets.",
-				  ];
+		if (!selection?.provider || !selection?.model) return undefined;
 		let text = "";
 		try {
 			const stream = llm.stream({
@@ -495,27 +647,141 @@ export function createPrLauncher(deps) {
 					{
 						id: randomUUID(),
 						role: "user",
-						content: [{ type: "text", text: ask.join("\n") }],
+						content: [{ type: "text", text: parts.join("\n") }],
 						source: { kind: "plugin", plugin: "@dsh-plugins/create-pr" },
 					},
 				],
 				system:
-					"You are a release engineer. Reply with the commit message ONLY: no markdown fences, no backticks around the subject, nothing before or after the message.",
+					"You are a release engineer. Reply with the requested message ONLY: no markdown fences, no backticks around the subject, nothing before or after the message.",
 				temperature: 0.2,
-				maxTokens: COMMIT_MAX_TOKENS,
+				maxTokens,
 			});
 			for await (const chunk of stream) {
 				if (chunk?.type === "text-delta") text += chunk.text;
 				if (chunk?.type === "finish" && chunk.reason && chunk.reason.kind !== "stop") {
-					text = "";
-					break;
+					return undefined;
 				}
 			}
 		} catch (error) {
-			warn(`create-pr: commit-message LLM call failed: ${error?.message ?? error}`);
-			return fallback;
+			warn(`create-pr: message LLM call failed: ${error?.message ?? error}`);
+			return undefined;
 		}
-		return parseConventionalMessage(text) ?? fallback;
+		return text;
+	}
+
+	/** Commit message for uncommitted work: conventional subject + ≤3 bullets. */
+	async function composeCommitMessage({ statText, diffText }) {
+		const fallback = deterministicFallbackMessage({ mode: "commit", statText });
+		const text = await askModel(
+			[
+				"Staged change about to be committed:",
+				"",
+				"File stats:",
+				statText,
+				"",
+				"Diff (truncated):",
+				diffText,
+				"",
+				"Write ONE conventional-commit message (type(scope)?: imperative description) summarizing this implementation, then a blank line, then at most 3 short body bullets.",
+			],
+			COMMIT_MAX_TOKENS,
+		);
+		return text ? (parseConventionalMessage(text) ?? fallback) : fallback;
+	}
+
+	/**
+	 * PR title + summary over the WHOLE branch delta (commits, file stats and a
+	 * truncated diff vs the merge base). The title must be a conventional
+	 * subject; the summary bullets ride into the body's `## Summary` section.
+	 * The `## Changes` / `## Commits` sections are appended deterministically by
+	 * {@link buildPrBody} — they never depend on the model answering.
+	 */
+	async function composePrMessage({ statText, diffText, commitSubjects }) {
+		const subjects = cleanSubjects(commitSubjects);
+		const fallback = deterministicFallbackMessage({
+			mode: "pr",
+			statText,
+			commitSubjects: subjects,
+		});
+		const text = await askModel(
+			[
+				`A branch is about to be opened as ONE GitHub pull request (${plural(subjects.length, "commit")}, ${plural(parseStatEntries(statText).length, "changed file")}).`,
+				"",
+				"Branch commit subjects:",
+				subjects.map((subject) => `- ${subject}`).join("\n") || "(none recorded)",
+				"",
+				"File stats against the base branch:",
+				statText || "(unavailable)",
+				"",
+				"Diff (truncated):",
+				diffText || "(unavailable)",
+				"",
+				"Write the pull request title and summary:",
+				"1. First line: ONE conventional-commit style title (feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert, optional scope, ': ', imperative description) summarizing the WHOLE branch.",
+				"2. Then one blank line, then at most 5 short markdown bullets starting with '- ' describing what this change does and why — lead with user-visible behavior, not file-by-file narration.",
+			],
+			PR_MAX_TOKENS,
+		);
+		const parsed = text ? parseConventionalMessage(text) : undefined;
+		const summary = parsed?.body || fileSummaryBullets(subjects);
+		return {
+			subject: parsed?.subject ?? fallback.subject,
+			body: buildPrBody({ summary, statText, commitSubjects: subjects }),
+		};
+	}
+
+	// ------------------------------------------------------------ branch digest
+
+	async function revParseCommit(top, ref) {
+		const probe = await runGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+			cwd: top,
+		});
+		return probe.code === 0 ? probe.out.split("\n")[0]?.trim() || undefined : undefined;
+	}
+
+	/**
+	 * Evidence bundle for the PR composer: everything between the fork point of
+	 * `base` and HEAD — commit subjects, `git diff --stat` digest and a capped
+	 * full diff. Each piece degrades independently to "" so an unusual ref
+	 * layout degrades the summary instead of failing the run.
+	 */
+	async function collectBranchDigest(top, base) {
+		const head = await revParseCommit(top, "HEAD");
+		const baseSha = base
+			? (await revParseCommit(top, base)) ?? (await revParseCommit(top, `origin/${base}`))
+			: undefined;
+		let range = "";
+		if (head && baseSha) {
+			const mergeBase = await runGit(["merge-base", baseSha, head], { cwd: top });
+			range =
+				mergeBase.code === 0 && mergeBase.out.trim()
+					? `${mergeBase.out.trim()}..${head}`
+					: `${baseSha}..${head}`;
+		}
+		const safeOut = async (argv) => {
+			try {
+				return await gitOut(argv, top);
+			} catch {
+				return "";
+			}
+		};
+		const [logText, statText, diffRaw] = await Promise.all([
+			safeOut(
+				range ? ["log", "--format=%s", range] : ["log", "--format=%s", "-n", "10", "HEAD"],
+			),
+			safeOut(range ? ["diff", "--stat", range] : ["diff", "--stat", "HEAD~10..HEAD"]),
+			safeOut(range ? ["diff", range] : []),
+		]);
+		return {
+			statText,
+			diffText: tail(diffRaw, DIFF_MAX_CHARS),
+			// Chronological order (oldest -> newest) reads like a change story.
+			commitSubjects: logText
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean)
+				.reverse(),
+		};
 	}
 
 	// ---------------------------------------------------------- the pipeline
@@ -535,6 +801,7 @@ export function createPrLauncher(deps) {
 			status: record.status,
 			prNumber: record.prNumber ?? null,
 			prUrl: record.prUrl ?? null,
+			prTitle: record.prTitle ?? null,
 			commitSha: record.commitSha ?? null,
 			commitSubject: record.commitSubject ?? null,
 			checks: Array.isArray(record.checks) ? record.checks.slice(-20) : [],
@@ -769,37 +1036,23 @@ export function createPrLauncher(deps) {
 			if (stagedEmpty.code === 0) dirty = false;
 		}
 		let base = await detectBaseBranch(top);
-		let composed;
 		if (dirty) {
 			setStatus(record, "committing");
 			const statOut = await gitOut(["diff", "--cached", "--stat"], top);
 			const diffText = tail(await gitOut(["diff", "--cached"], top), DIFF_MAX_CHARS);
-			composed = await composeMessage({ mode: "commit", statText: statOut, diffText });
-			const args = ["commit", "-m", composed.subject];
-			if (composed.body) args.push("-m", composed.body);
-			await runGit(args, { cwd: top });
-		} else {
-			let digest = "";
-			if (base) {
-				try {
-					digest = await gitOut(
-						["log", "--format=%s%n%b---", `${base}..HEAD`],
-						top,
-					);
-				} catch {
-					digest = "";
-				}
-			}
-			composed = await composeMessage({
-				mode: "pr",
-				statText: digest || `branch ${record.branch}`,
-				diffText: "",
+			const composedCommit = await composeCommitMessage({
+				statText: statOut,
+				diffText,
 			});
+			const args = ["commit", "-m", composedCommit.subject];
+			if (composedCommit.body) args.push("-m", composedCommit.body);
+			await runGit(args, { cwd: top });
+			record.commitSubject = composedCommit.subject;
 		}
-		record.commitSubject = composed.subject;
 		record.commitSha = await gitOut(["rev-parse", "HEAD"], top);
 
-		// 2. Push the branch.
+		// 2. Push the branch (before composing the PR text: an adopted PR needs
+		//    no title/body and must not spend a single token).
 		setStatus(record, "pushing");
 		await runGit(["push", "-u", "origin", record.branch], {
 			cwd: top,
@@ -814,6 +1067,9 @@ export function createPrLauncher(deps) {
 			record.prUrl = existing.url;
 			record.note = "existing PR adopted";
 		} else {
+			const digest = await collectBranchDigest(top, base);
+			const composed = await composePrMessage(digest);
+			record.prTitle = composed.subject;
 			const args = [
 				"pr",
 				"create",

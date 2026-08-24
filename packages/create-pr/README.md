@@ -7,8 +7,10 @@ the current session's work to a host-side pipeline.
 
 ## What one click does
 
-Every deterministic step is plain code/CLI — the LLM is used exactly once, for
-the commit message:
+Every deterministic step is plain code/CLI — the LLM is used at most twice:
+once for the commit message (only when work is uncommitted), once for the PR
+title/summary (only when a PR is actually created; an adopted PR costs zero
+tokens):
 
 1. **Resolve** the repository: request `root` → owning session's `cwd` → row
    config `cwd`. Refuses the base branch (`main`/`master`) and non-GitHub
@@ -17,11 +19,37 @@ the commit message:
    conventional-commit message comes from ONE `ctx.llm` streaming call over a
    truncated `git diff --cached --stat`/diff digest; off-format answers fall
    back to a deterministic `docs:/test:/chore:` message derived from file
-   paths. With a clean tree the existing `base..HEAD` commits are summarized
-   instead.
+   paths.
 3. **Push** the branch (`git push -u origin <branch>`).
 4. **Open** the PR (`gh pr create -R owner/repo --head … --title … --body …`);
-   a PR already open for the branch is adopted, never duplicated.
+   a PR already open for the branch is adopted, never duplicated — adoption
+   never rewrites its title/body.
+
+   The PR text is composed from the WHOLE branch delta, not just the last
+   commit: commit subjects + `git diff --stat` + a truncated diff against the
+   merge base of `HEAD` and the detected base branch. The **title** comes
+   from an LLM one-shot (conventional subject covering the whole branch) with
+   a deterministic fallback that reuses a single conventional commit subject
+   verbatim or derives type/scope from the branch's own commits
+   (`feat(api): land 3 commits across 5 files`). The **body** is always
+   assembled deterministically, Claude Code / Codex style:
+
+   ```markdown
+   ## Summary
+   - LLM bullets, or the branch's commit subjects when no LLM answered
+
+   ## Changes
+   - packages/create-pr/lib/index.js (+210 -34)
+   - assets/logo.png (binary)
+
+   ## Commits
+   - feat(api): add endpoint
+   - fix(api): guard it
+
+   ---
+   _Opened via the DSH create-pr plugin._
+   ```
+
 5. **Watch CI (the hook mechanism).** A per-run watchdog polls
    `gh pr view --json statusCheckRollup` on a timer until every check settles.
    Polling (not webhooks) because the harness binds loopback only. On failure:
