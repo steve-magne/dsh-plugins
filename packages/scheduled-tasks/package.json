@@ -1,0 +1,19 @@
+{
+	"name": "@dsh-plugins/scheduled-tasks",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "DSH web plugin: cron-scheduled prompts — a Scheduled Tasks page in the Settings modal (workspace, model, cron, prompt); each firing runs one unattended LLM iteration in an isolated worktree cut from up-to-date main and opens a GitHub pull request",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
+	},
+	"dsh": {
+		"client": {
+			"platform": "web",
+			"inject": []
+		}
+	},
+	"license": "MIT"
+}
