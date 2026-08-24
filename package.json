@@ -1,0 +1,11 @@
+{
+	"name": "dsh-plugins",
+	"description": "DeepSeek Harness plugins: dual-face cordis packages (host half + browser half) extending the DSH web surface",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "node packages/command-deck/test/run.mjs && node packages/command-deck/test/client-check.mjs"
+	},
+	"license": "MIT"
+}

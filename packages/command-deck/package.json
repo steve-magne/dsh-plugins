@@ -1,0 +1,20 @@
+{
+	"name": "@dsh-plugins/command-deck",
+	"description": "DeepSeek Harness plugin: a right-docked Command Deck sidebar for the web surface — save shell commands, run them on the host, stream their output, stop them with one click",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
+	},
+	"dsh": {
+		"client": {
+			"platform": "web",
+			"inject": []
+		}
+	},
+	"private": true,
+	"license": "MIT"
+}
