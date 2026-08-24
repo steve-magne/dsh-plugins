@@ -13,6 +13,7 @@ releases or inherit product quality gates.
 | [`@dsh-plugins/command-deck`](packages/command-deck/) | Right-docked sidebar: save shell commands, run them on the host, stream their output, stop them in one click |
 | [`@dsh-plugins/worktree-launcher`](packages/worktree-launcher/) | One isolated git worktree (`<repo>/.dsh/worktrees/dsh-word-word-word`, based on an up-to-date main) materialized for every new chat session, with an ON-by-default toggle in the composer |
 | [`@dsh-plugins/create-pr`](packages/create-pr/) | One-click GitHub PR from a "Create PR" button beside the Worktree toggle: deterministic git/gh plumbing, one LLM call for the conventional-commit message, and a CI watchdog that wakes the owning session to fix failures |
+| [`@dsh-plugins/scheduled-tasks`](packages/scheduled-tasks/) | "Scheduled Tasks" page in the Settings modal: cron-scheduled prompts (workspace, model, cron, prompt) where each firing cuts an isolated worktree from up-to-date main, runs one unattended LLM iteration inside it, then pushes the branch and opens a GitHub PR |
 
 ## Repository layout
 
