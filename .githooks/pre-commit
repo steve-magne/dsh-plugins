@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit guard — verifies the packaging contract before every commit.
+#
+# Checks that every plugin package carries its required files (package.json,
+# README.md, lib/index.js, lib/client.js), normalizes manifest metadata to the
+# canonical marketplace shape, re-stages what it repaired (staged files only),
+# and fails the commit on anything it cannot fix.
+#
+# One-time activation (already run on this clone):
+#   git config core.hooksPath .githooks
+
+node "$(git rev-parse --show-toplevel)/scripts/marketplace-guard.mjs" --fix || exit 1

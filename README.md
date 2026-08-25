@@ -83,6 +83,22 @@ subprocesses / a stubbed browser surface):
 pnpm test    # runs every package's suites
 ```
 
+## Pre-commit guard
+
+Every commit passes through [`scripts/marketplace-guard.mjs`](scripts/marketplace-guard.mjs)
+(via `.githooks/pre-commit`, activate on a fresh clone with
+`git config core.hooksPath .githooks`). It guarantees that the files the DSH
+scan and the marketplaces read are present — per-plugin `package.json`,
+`README.md`, `lib/index.js`, `lib/client.js`; root `LICENSE.md`,
+`pnpm-workspace.yaml`, listing rows in this README — normalizes every manifest
+to the canonical marketplace shape (`repository.directory`, keywords prefix,
+`files` whitelist, `publishConfig`, exports contract), re-stages what it
+repaired (staged files only, never sweeps unrelated work-in-progress), checks
+the three-way identity package name ↔ client registration id, and runs
+`node --check` over each shipped `lib/*.js`. Anything it cannot derive is
+reported as a hard error instead of being scaffolded. Run it standalone with
+`node scripts/marketplace-guard.mjs [--fix]`.
+
 See [AGENTS.md](AGENTS.md) for the architecture contract every plugin here
 must follow.
 
