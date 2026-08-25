@@ -35,9 +35,30 @@ on each other's files.
      `git status` stays clean.
 4. A scoped system-prompt section tells the model to run everything inside the
    worktree for that session; a chip under the composer shows branch and path.
+5. **Session-list git badges.** A headless overlay entry polls
+   `GET /api/session-states` and paints a small git logo on each sidebar
+   session row — between the row's title and its relative-time label — colored
+   by the live GitHub state of that worktree's branch:
+
+   | Logo | Meaning |
+   | --- | --- |
+   | 🟢 green | worktree created, no PR for the branch yet |
+   | 🔵 blue | a PR is open for the branch (checks passing, running or absent) |
+   | 🔴 red | problem: a check failed, or the PR was closed unmerged |
+   | 🟣 purple | the PR was merged |
+
+   The host resolves each session's display title through the optional
+   `sessionQuery` service and asks `gh pr view <branch> --json
+   number,url,state,statusCheckRollup` per branch behind a TTL cache
+   (`prTtlMs`). Rows are matched **by title** in the browser and painted via a
+   `data-wtl-git` attribute plus pure CSS — no React-managed child node is ever
+   touched. Degradation is graceful: without `gh`, without a GitHub origin, or
+   when titles cannot be resolved, every badge simply stays green (or absent).
 
 Removing the plugin (or flipping the toggle off) restores the stock composer
-exactly; existing worktrees are left on disk for you to keep or prune via the API.
+exactly; existing worktrees are left on disk for you to keep or prune via the
+API. The badges require `gh` to be installed and authenticated (`gh auth
+status`) with `repo` scope for anything beyond green.
 
 ## How it fits DSH
 
@@ -46,7 +67,7 @@ Dual-face cordis plugin, the same shape as `@dsh-plugins/command-deck`:
 | Half | File | Role |
 | --- | --- | --- |
 | Host | `lib/index.js` | Registers a `prefix` route `/worktree-launcher/api` on `ctx.webServer`; runs git through `ctx.subprocess`; listens to `agent/session-start` / `agent/inbox/inserted`; contributes a scoped `systemPrompt.section` |
-| Browser | `lib/client.js` | Lazy-CJS factory bundle; injects into the runtime-owned `conversation.input.left` and `conversation.composer.dock` slots; zero deps beyond shell-seeded React |
+| Browser | `lib/client.js` | Lazy-CJS factory bundle; injects into the runtime-owned `conversation.input.left`, `conversation.composer.dock` and `shell.overlay` slots (the last one paints the session-list git badges); zero deps beyond shell-seeded React |
 
 The browser discovers the client bundle automatically: the node half of
 `dsh-client-modules` scans Loader entries for packages declaring
@@ -79,7 +100,10 @@ ln -s /Users/stevemagne/workspace/dsh-plugins/packages/worktree-launcher \
 | `enabled` | `true` | Initial value of the auto-worktree preference (the toggle overrides at runtime) |
 | `baseBranch` | auto (`main` → `master` → `origin/HEAD`) | Force the base branch instead of detecting it |
 | `fetchTimeoutMs` | `20000` | Budget for `git fetch` / `git pull --ff-only` before degrading gracefully |
-| `debug` | `false` | Log best-effort failures (auto-create errors, exclude-file issues) with `console.warn` |
+| `ghPath` | PATH lookup | Explicit `gh` binary for the PR-status probes |
+| `prTtlMs` | `60000` | Cache TTL per branch before the badge feed re-runs `gh pr view` |
+| `ghTimeoutMs` | `10000` | Budget for one `gh pr view` call |
+| `debug` | `false` | Log best-effort failures (auto-create errors, exclude-file issues, gh probes) with `console.warn` |
 
 ## HTTP API (loopback only)
 
@@ -97,6 +121,9 @@ All endpoints answer JSON under the prefix route:
   `dsh-*` branch is deliberately kept on removal — it may carry commits you
   still want; drop it yourself with `git branch -D` when done.
 - `GET    /worktree-launcher/api/by-session/:sessionId` → record bound to a session
+- `GET    /worktree-launcher/api/session-states` → badge feed: `{states:[{sessionId,
+  title, state: created\|pr\|problem\|merged, branch, prNumber?, prUrl?}]}` — one
+  entry per worktree whose session title resolved (records newest first)
 
 Trust posture matches the harness web server itself: loopback bind, no auth,
 plus a Host allowlist (`localhost`/`127.0.0.1`/`[::1]`) against DNS rebinding

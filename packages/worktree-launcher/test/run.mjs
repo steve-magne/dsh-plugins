@@ -13,7 +13,7 @@ import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BRANCH_PATTERN, createWorktreeLauncher } from "../lib/index.js";
+import { BRANCH_PATTERN, classifyChecks, createSessionTitleLister, createWorktreeLauncher, deriveBadgeState } from "../lib/index.js";
 
 // ---------------------------------------------------------------- git fixture
 
@@ -185,6 +185,78 @@ async function call(launcher, options) {
 	return { status: fake.status, payload: JSON.parse(fake.body) };
 }
 
+/** Pre-settled subprocess handle for intercepted gh calls. */
+function fakeHandle({ code, out = "", err = "" }) {
+	const text = out;
+	return {
+		pid: -1,
+		done: Promise.resolve({ exitCode: code, signal: null }),
+		collected: {
+			stdout: {
+				readFrom(fromByte) {
+					return { text: text.slice(fromByte), nextOffset: text.length, lossy: false };
+				},
+			},
+			stderr: {
+				readFrom(fromByte) {
+					return { text: err.slice(fromByte), nextOffset: err.length, lossy: false };
+				},
+			},
+		},
+		terminate() {},
+		async waitForExit() {
+			return true;
+		},
+	};
+}
+
+/**
+ * Launcher over real git plus an in-memory fake `gh`: branch -> PR JSON (or
+ * absence) is decided by the mutable `prConfig` map, and every gh invocation
+ * is recorded so tests can assert the TTL cache.
+ */
+function makeGhLauncher({ prConfig, titles, prTtlMs = 60 }) {
+	const ghCalls = [];
+	const launcher = createWorktreeLauncher({
+		spawn: (spec) => {
+			if (spec.argv[0] === "gh") {
+				ghCalls.push(spec.argv.slice(1));
+				const view = argvBranch(spec.argv);
+				const json = prConfig.get(view);
+				if (!json) return fakeHandle({ code: 1, err: `no pull request for ${view}` });
+				return fakeHandle({ code: 0, out: json });
+			}
+			return spawnStub(spec);
+		},
+		resolveExecutable: async (command) => command,
+		listSessionTitles: titles,
+		prTtlMs,
+		warn: (message) => warnings.push(message),
+	});
+	return { launcher, ghCalls };
+}
+
+function argvBranch(argv) {
+	const index = argv.indexOf("view");
+	return index >= 0 ? argv[index + 1] : "";
+}
+
+function prView(payload) {
+	return JSON.stringify({
+		number: 7,
+		url: "https://github.com/ex/repo/pull/7",
+		state: "OPEN",
+		statusCheckRollup: [],
+		...payload,
+	});
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const byTitle = (states, title) => states.find((entry) => entry.title === title);
+
 // -------------------------------------------------------------------- tests
 
 let passed = 0;
@@ -215,6 +287,7 @@ const projectOffline = await makeProject();
 pushCommitToOrigin(projectOffline);
 await rm(join(projectOffline.dir, "origin.git"), { recursive: true, force: true });
 const projectNoRemote = await makeProject({ dropOrigin: true });
+const projectPr = await makeProject();
 
 await test("answers unknown endpoints with 404 and rejects foreign hosts with 403", async () => {
 	const missing = await call(launcher, {
@@ -500,6 +573,171 @@ await test("minted branch names are unique under repetition pressure", async () 
 	}
 });
 
+await test("badge derivation: check vocabulary and PR states map onto the four colors", () => {
+	assert.equal(deriveBadgeState(null), "created");
+	assert.equal(deriveBadgeState(undefined), "created");
+	assert.equal(deriveBadgeState({ state: "MERGED" }), "merged");
+	assert.equal(deriveBadgeState({ state: "CLOSED" }), "problem");
+	assert.equal(deriveBadgeState({ state: "OPEN", statusCheckRollup: [] }), "pr");
+	assert.equal(
+		deriveBadgeState({
+			state: "OPEN",
+			statusCheckRollup: [{ conclusion: "SUCCESS" }, { status: "IN_PROGRESS" }],
+		}),
+		"pr",
+	);
+	assert.equal(
+		deriveBadgeState({
+			state: "OPEN",
+			statusCheckRollup: [{ name: "ci", conclusion: "FAILURE" }],
+		}),
+		"problem",
+	);
+	assert.equal(
+		deriveBadgeState({ state: "OPEN", statusCheckRollup: [{ state: "ERROR" }] }),
+		"problem",
+	);
+	assert.equal(classifyChecks([]).outcome, "empty");
+	assert.equal(classifyChecks([{ conclusion: "SUCCESS" }]).outcome, "passed");
+	assert.equal(classifyChecks([{ status: "QUEUED" }]).outcome, "pending");
+	assert.equal(classifyChecks([{ conclusion: "TIMED_OUT" }]).outcome, "failed");
+});
+
+await test("title lister tolerates sessionQuery shapes; absent service yields empty", async () => {
+	const viaSnapshots = createSessionTitleLister({
+		readTitleSnapshots: async (ids) =>
+			ids.map((id, index) =>
+				index % 2 === 0
+					? { sessionId: id, title: `  Title ${id}  ` }
+					: { snapshot: { title: `Title ${id}` } },
+			),
+	});
+	assert.deepEqual(await viaSnapshots(["a", "b"]), [
+		{ sessionId: "a", title: "Title a" },
+		{ sessionId: "b", title: "Title b" },
+	]);
+
+	let queried = null;
+	const viaList = createSessionTitleLister({
+		listSessions: async () => {
+			queried = "called";
+			return [
+				{ sessionId: "a", title: "Alpha" },
+				{ id: "b", displayTitle: "Beta" },
+				{ sessionId: "outsider", title: "Nope" },
+			];
+		},
+	});
+	assert.deepEqual(await viaList(["a", "b"]), [
+		{ sessionId: "a", title: "Alpha" },
+		{ sessionId: "b", title: "Beta" },
+	]);
+	assert.equal(queried, "called");
+
+	const none = createSessionTitleLister(undefined, { warn: (message) => warnings.push(message) });
+	assert.deepEqual(await none(["a"]), []);
+});
+
+await test("session-states joins titles with live PR states behind a TTL cache", async () => {
+	const prConfig = new Map();
+	const titles = async (ids) => ids.map((id) => ({ sessionId: id, title: `Session ${id}` }));
+	const ttlMs = 60;
+	const { launcher: lp, ghCalls } = makeGhLauncher({ prConfig, titles, prTtlMs: ttlMs });
+
+	await call(lp, {
+		method: "POST",
+		url: "/worktree-launcher/api/worktrees",
+		body: { root: projectPr.root, sessionId: "session-red" },
+	});
+	await call(lp, {
+		method: "POST",
+		url: "/worktree-launcher/api/worktrees",
+		body: { root: projectPr.root, sessionId: "session-green" },
+	});
+	const redBranch = lp.recordForSession("session-red").branch;
+	const greenBranch = lp.recordForSession("session-green").branch;
+	assert.notEqual(redBranch, greenBranch);
+
+	// No PR configured yet: every session is a plain created worktree (green).
+	const fresh = await call(lp, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.equal(fresh.status, 200);
+	assert.deepEqual(fresh.payload.states.map((entry) => entry.sessionId).sort(), [
+		"session-green",
+		"session-red",
+	]);
+	assert.equal(byTitle(fresh.payload.states, "Session session-red").state, "created");
+	assert.equal(byTitle(fresh.payload.states, "Session session-green").state, "created");
+	assert.match(byTitle(fresh.payload.states, "Session session-red").branch, BRANCH_PATTERN);
+	const callsAfterFresh = ghCalls.length;
+	assert.equal(callsAfterFresh, 2);
+
+	// Within the TTL no new gh process runs.
+	await call(lp, { method: "GET", url: "/worktree-launcher/api/session-states" });
+	assert.equal(ghCalls.length, callsAfterFresh, "TTL cache must absorb repeat polls");
+
+	// CI turns failing on the red session's branch -> problem (red).
+	prConfig.set(
+		redBranch,
+		prView({ statusCheckRollup: [{ name: "ci", conclusion: "FAILURE" }] }),
+	);
+	await sleep(ttlMs + 60);
+	const failing = await call(lp, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.equal(byTitle(failing.payload.states, "Session session-red").state, "problem");
+	assert.equal(byTitle(failing.payload.states, "Session session-red").prNumber, 7);
+	assert.equal(
+		byTitle(failing.payload.states, "Session session-red").prUrl,
+		"https://github.com/ex/repo/pull/7",
+	);
+	assert.equal(byTitle(failing.payload.states, "Session session-green").state, "created");
+
+	// Recovered CI -> open PR (blue).
+	prConfig.set(redBranch, prView({}));
+	await sleep(ttlMs + 60);
+	const recovered = await call(lp, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.equal(byTitle(recovered.payload.states, "Session session-red").state, "pr");
+
+	// Merged -> purple.
+	prConfig.set(redBranch, prView({ state: "MERGED" }));
+	await sleep(ttlMs + 60);
+	const merged = await call(lp, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.equal(byTitle(merged.payload.states, "Session session-red").state, "merged");
+
+	// Closed without merging stays a problem.
+	prConfig.set(redBranch, prView({ state: "CLOSED" }));
+	await sleep(ttlMs + 60);
+	const closed = await call(lp, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.equal(byTitle(closed.payload.states, "Session session-red").state, "problem");
+
+	// Sessions whose title never resolves never reach the feed.
+	const untitled = makeGhLauncher({ prConfig, titles: async () => [] });
+	await call(untitled.launcher, {
+		method: "POST",
+		url: "/worktree-launcher/api/worktrees",
+		body: { root: projectPr.root, sessionId: "session-x" },
+	});
+	const hidden = await call(untitled.launcher, {
+		method: "GET",
+		url: "/worktree-launcher/api/session-states",
+	});
+	assert.deepEqual(hidden.payload.states, []);
+	assert.ok(untitled.ghCalls.length === 0, "no gh call without a matchable row");
+});
+
 await test("shutdown drops all state", async () => {
 	launcher.shutdown();
 	const listed = await call(launcher, {
@@ -510,7 +748,7 @@ await test("shutdown drops all state", async () => {
 });
 
 // Leave no scratch behind on success.
-for (const project of [projectA, projectOffline, projectNoRemote]) {
+for (const project of [projectA, projectOffline, projectNoRemote, projectPr]) {
 	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
 }
 

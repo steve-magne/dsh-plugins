@@ -10,10 +10,17 @@
  *     row of the chat window (ON by default); flipping it persists locally and
  *     syncs the host-side preference that gates auto-creation;
  *   - `conversation.composer.dock` — an ambient readout of the session's
- *     worktree (`dsh-word-word-word` + path copy) once the host created one.
+ *     worktree (`dsh-word-word-word` + path copy) once the host created one;
+ *   - `shell.overlay`             — a headless session-list painter: it polls
+ *     the host's per-session git/PR state feed and stamps `data-wtl-git`
+ *     attributes onto matching sidebar session rows; CSS then draws a small
+ *     git logo between each row's title and its relative-time label — green
+ *     = worktree created, blue = PR open, red = CI failing (or PR closed
+ *     unmerged), purple = merged. Only attributes are ever written
+ *     (React never strips unknown ones); no child nodes are injected.
  *
- * Both seats are list slots, so unmounting this plugin restores the stock
- * composer exactly.
+ * All seats are additive, so unmounting this plugin restores the stock shell
+ * exactly.
  */
 window.__ModuleLoader__.load({
 	id: "@dsh-plugins/worktree-launcher",
@@ -47,6 +54,26 @@ window.__ModuleLoader__.load({
 			".wtl-copy{background:none;border:0;padding:0 2px;cursor:pointer;font-size:11px;" +
 			"color:var(--dsw-alias-label-tertiary,#8b8b93)}" +
 			".wtl-copy:hover{color:var(--dsw-alias-label-primary,#fff)}";
+
+		/** Monochrome git-branch glyph, recolored per state via background-color + mask. */
+		const BADGE_SVG =
+			"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z'/%3E%3C/svg%3E";
+
+		const badgeCss =
+			// The relative-time label of a session row is its penultimate child
+			// span (…, title, time, row-menu); drawing on its ::before puts the
+			// logo exactly between the title and the time without touching any
+			// React-managed child.
+			'[data-wtl-git] > span:nth-last-child(2)::before{content:"";display:inline-block;' +
+			"width:11px;height:11px;margin-right:5px;vertical-align:-1px;background-color:" +
+			"var(--dsw-alias-state-success-primary,#3fb950);" +
+			`-webkit-mask:url("${BADGE_SVG}") center/contain no-repeat;` +
+			`mask:url("${BADGE_SVG}") center/contain no-repeat}` +
+			'[data-wtl-git="pr"] > span:nth-last-child(2)::before{background-color:#4493f8}' +
+			'[data-wtl-git="problem"] > span:nth-last-child(2)::before{background-color:' +
+			"var(--dsw-alias-state-error-primary,#f85149)}" +
+			'[data-wtl-git="merged"] > span:nth-last-child(2)::before{background-color:#a371f7}';
+
 		const tagId = "@dsh-plugins/worktree-launcher/launcher.css";
 		if (
 			typeof document !== "undefined" &&
@@ -55,8 +82,175 @@ window.__ModuleLoader__.load({
 			const tag = document.createElement("style");
 			tag.dataset.plugin = "@dsh-plugins/worktree-launcher";
 			tag.dataset.pluginCss = tagId;
-			tag.textContent = css;
+			tag.textContent = css + badgeCss;
 			document.head.appendChild(tag);
+		}
+		//#endregion
+
+		//#region session list badges
+		const STATES_POLL_MS = 30_000;
+		const RESCAN_DEBOUNCE_MS = 200;
+
+		function normalizeTitle(text) {
+			return String(text ?? "")
+				.replace(/\s+/g, " ")
+				.trim();
+		}
+
+		function childrenOf(node) {
+			if (!node || !node.children || typeof node.children.length !== "number") return [];
+			return Array.from(node.children);
+		}
+
+		function attrOf(node, name) {
+			if (!node || typeof node.getAttribute !== "function") return undefined;
+			try {
+				return node.getAttribute(name);
+			} catch {
+				return undefined;
+			}
+		}
+
+		function hasButtonDescendant(node, depth = 0) {
+			if (!node || depth > 4) return false;
+			if (String(node.tagName ?? "").toUpperCase() === "BUTTON") return true;
+			for (const child of childrenOf(node)) {
+				if (hasButtonDescendant(child, depth + 1)) return true;
+			}
+			return false;
+		}
+
+		/**
+		 * Stamp or clear `data-wtl-git="<state>"` onto sidebar session rows by
+		 * matching each row's title against {@link statesByTitle}. Rows are
+		 * identified structurally — `[role=treeitem]` whose last child holds a
+		 * button (the row menu) and whose penultimate child is a SPAN (the
+		 * relative-time label) — never via hashed class names. Workspace group
+		 * rows, search results and blank rows fail that shape test and are left
+		 * untouched. Pure over minimal node objects so tests run without a DOM.
+		 * @returns {Set} every row visited this pass (painted or cleared).
+		 */
+		function scanSessionRows(root, statesByTitle) {
+			const rows = [];
+			const collect = (node) => {
+				for (const child of childrenOf(node)) {
+					if (attrOf(child, "role") === "treeitem") {
+						rows.push(child);
+						continue;
+					}
+					collect(child);
+				}
+			};
+			collect(root);
+			const touched = new Set();
+			for (const row of rows) {
+				touched.add(row);
+				const kids = childrenOf(row);
+				let state;
+				if (
+					kids.length >= 3 &&
+					hasButtonDescendant(kids[kids.length - 1]) &&
+					String(kids[kids.length - 2]?.tagName ?? "").toUpperCase() === "SPAN"
+				) {
+					state = statesByTitle.get(normalizeTitle(kids[kids.length - 3]?.textContent));
+				}
+				if (state) {
+					if (typeof row.setAttribute === "function") row.setAttribute("data-wtl-git", state);
+				} else if (typeof row.removeAttribute === "function") {
+					row.removeAttribute("data-wtl-git");
+				}
+			}
+			return touched;
+		}
+
+		/**
+		 * Headless overlay entry: polls the host state feed and repaints rows on
+		 * DOM mutations. Renders nothing; owns every timer/observer it creates.
+		 */
+		function SessionGitBadges() {
+			const statesRef = react.useRef(new Map());
+			const paintedRef = react.useRef(new Set());
+
+			react.useEffect(() => {
+				let live = true;
+				let pending = null;
+				let intervalId = null;
+				let observer = null;
+
+				const repaint = () => {
+					try {
+						if (typeof document === "undefined" || !document.body) return;
+						for (const node of scanSessionRows(document.body, statesRef.current)) {
+							paintedRef.current.add(node);
+						}
+					} catch {
+						/* a hostile node shape must never break the page */
+					}
+				};
+				const requestRepaint = () => {
+					if (pending !== null) return;
+					pending = window.setTimeout(() => {
+						pending = null;
+						if (live) repaint();
+					}, RESCAN_DEBOUNCE_MS);
+				};
+				const poll = () => {
+					fetchSessionStates()
+						.then((payload) => {
+							if (!live) return;
+							const byTitle = new Map();
+							for (const entry of Array.isArray(payload?.states) ? payload.states : []) {
+								if (
+									entry &&
+									typeof entry.title === "string" &&
+									typeof entry.state === "string"
+								) {
+									byTitle.set(normalizeTitle(entry.title), entry.state);
+								}
+							}
+							statesRef.current = byTitle;
+							repaint();
+						})
+						.catch(() => {});
+				};
+				const onVisible = () => {
+					if (document.visibilityState === "visible") poll();
+				};
+
+				if (typeof MutationObserver === "function" && document.body) {
+					observer = new MutationObserver(requestRepaint);
+					observer.observe(document.body, {
+						childList: true,
+						subtree: true,
+						characterData: true,
+					});
+				}
+				if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+					document.addEventListener("visibilitychange", onVisible);
+				}
+				intervalId = window.setInterval(poll, STATES_POLL_MS);
+				poll();
+
+				return () => {
+					live = false;
+					if (pending !== null) window.clearTimeout(pending);
+					window.clearInterval(intervalId);
+					if (observer) observer.disconnect();
+					if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+						document.removeEventListener("visibilitychange", onVisible);
+					}
+					for (const node of paintedRef.current) {
+						try {
+							node?.removeAttribute?.("data-wtl-git");
+						} catch {
+							/* detached node */
+						}
+					}
+					paintedRef.current.clear();
+				};
+			}, []);
+
+			return null;
 		}
 		//#endregion
 
@@ -97,6 +291,9 @@ window.__ModuleLoader__.load({
 			return apiFetch(`/by-session/${encodeURIComponent(sessionId)}`, {
 				method: "GET",
 			});
+		}
+		function fetchSessionStates() {
+			return apiFetch("/session-states", { method: "GET" });
 		}
 		//#endregion
 
@@ -280,11 +477,23 @@ window.__ModuleLoader__.load({
 					WorktreeChip,
 				),
 			);
+			ctx.slots.inject("shell.overlay", () =>
+				ctx.slots.register(
+					{
+						name: "shell.overlay",
+						id: "session-git-badges",
+						order: 50,
+					},
+					SessionGitBadges,
+				),
+			);
 		}
 		//#endregion
 
 		exports.apply = apply;
 		exports.inject = inject;
+		exports.scanSessionRows = scanSessionRows;
+		exports.normalizeTitle = normalizeTitle;
 		return module.exports;
 	},
 });
