@@ -84,9 +84,12 @@ assert.equal(
 
 // ---- stub externals -------------------------------------------------------
 
-function makeStubReact() {
+function makeStubReact(stateQueue = []) {
 	const hooks = {
-		useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+		useState: (init) => {
+			if (stateQueue.length > 0) return [stateQueue.shift(), () => {}];
+			return [typeof init === "function" ? init() : init, () => {}];
+		},
 		useEffect: () => undefined,
 		useRef: (value) => ({ current: value }),
 		useCallback: (fn) => fn,
@@ -95,11 +98,12 @@ function makeStubReact() {
 	return hooks;
 }
 const jsxStub = (type, props) => ({ type, props });
-const requireStub = (specifier) => {
-	if (specifier === "react") return makeStubReact();
+const requireWith = (react) => (specifier) => {
+	if (specifier === "react") return react;
 	if (specifier === "react/jsx-runtime") return { jsx: jsxStub, jsxs: jsxStub };
 	throw new Error(`unexpected external request: ${specifier}`);
 };
+const requireStub = requireWith(makeStubReact());
 
 // ---- materialize ----------------------------------------------------------
 
@@ -175,9 +179,88 @@ assert.match(
 	/\.cpr-btn\{/,
 	"stylesheet must style the create-pr button",
 );
+assert.match(
+	sandbox.appendedStyle.textContent,
+	/\.cpr-btn\.merged\{[^}]*#ab7df8/,
+	"stylesheet must carry the VIOLET merged pill rule",
+);
+assert.match(
+	sandbox.appendedStyle.textContent,
+	/\.cpr-dot\.merged\{/,
+	"stylesheet must carry the violet merged dot rule",
+);
+
+// ---- merged / passed pill rendering ---------------------------------------
+// The component closes over the `react` external of ITS materialization, so
+// each scripted state needs its own factory call with a seeded useState queue
+// ([run, busy, error]).
+
+function componentWithRun(run) {
+	const entries = [];
+	const face = registration.factory(
+		requireWith(makeStubReact([run, false, null])),
+	);
+	face.apply({
+		slots: {
+			inject(slotName, factory) {
+				factory();
+			},
+			register(options, component) {
+				entries.push(component);
+				return () => {};
+			},
+		},
+	});
+	assert.equal(entries.length, 1);
+	return entries[0]({});
+}
+
+{
+	const tree = componentWithRun({
+		id: "run-merged",
+		branch: "feat/widget",
+		status: "merged",
+		prNumber: 7,
+		prUrl: "https://github.com/acme/widget/pull/7",
+		prTitle: "feat(widget): ship it",
+		checks: [],
+		note: "merged upstream at 2026-02-06T12:00:00Z",
+	});
+	const children = tree.props.children;
+	const link = Array.isArray(children) ? children[0] : children;
+	assert.equal(link.type, "a", "a merged PR renders as a link pill");
+	assert.equal(link.props.href, "https://github.com/acme/widget/pull/7");
+	assert.ok(
+		/\bcpr-btn merged\b/.test(link.props.className),
+		`merged pill must carry the violet class, got ${link.props.className}`,
+	);
+	const [dot, label] = link.props.children;
+	assert.ok(/\bcpr-dot merged\b/.test(dot.props.className), "merged dot must be violet");
+	assert.equal(label.props.children, "merged #7", "merged label reads 'merged #n'");
+}
+
+{
+	const tree = componentWithRun({
+		id: "run-passed",
+		branch: "feat/widget",
+		status: "passed",
+		prNumber: 7,
+		prUrl: "https://github.com/acme/widget/pull/7",
+		checks: [],
+	});
+	const children = tree.props.children;
+	const link = Array.isArray(children) ? children[0] : children;
+	assert.equal(link.type, "a");
+	assert.ok(
+		/\bcpr-btn ok\b/.test(link.props.className),
+		"a merely-passed PR stays GREEN, distinct from the violet merged pill",
+	);
+	assert.equal(link.props.children[1].props.children, "✓ #7");
+}
 
 console.log("client-bundle contract OK:");
 console.log("  - registers under id @dsh-plugins/create-pr");
 console.log("  - injects 'conversation.input.left' as entry 'create-pr-button' (order 45)");
 console.log("  - idle render: <button data-testid=create-pr-button> 'Create PR'");
+console.log("  - pill lifecycle: green on CI pass, VIOLET ('merged #n') when merged");
 console.log("  - stylesheet injected at materialization");

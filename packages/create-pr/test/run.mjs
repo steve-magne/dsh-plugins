@@ -87,7 +87,9 @@ async function makeStateDir() {
 /**
  * A deterministic gh stand-in. Behavior is driven by files inside
  * $CREATE_PR_FAKE_STATE (passed through the stubbed spawn env):
- *   checks.json    — answer body for `gh pr view` (rollup snapshots)
+ *   view.json      — answer body for `gh pr view` (full shape incl. state)
+ *   checks.json    — answer body for `gh pr view` (rollup snapshots; fallback
+ *                    when view.json is absent)
  *   pr-list.json   — answer body for `gh pr list --head …` (PR adoption)
  *   runs.json      — answer body for `gh run list`
  *   fail-log.txt   — answer body for `gh run view --log-failed`
@@ -125,7 +127,8 @@ function installFakeGh(dir) {
 			'        exit 0;;',
 			"      view)",
 			'        log "pr view";',
-			'        if [ -f "$STATE/checks.json" ]; then cat "$STATE/checks.json";',
+			'        if [ -f "$STATE/view.json" ]; then cat "$STATE/view.json";',
+			'        elif [ -f "$STATE/checks.json" ]; then cat "$STATE/checks.json";',
 			'          else echo \'{"url":"https://github.com/acme/widget/pull/1","number":1,"statusCheckRollup":[]}\'; fi',
 			'        exit 0;;',
 			"      *) echo \"unexpected pr sub: $sub\" >&2; exit 64;;",
@@ -309,6 +312,8 @@ function makeLauncher(options = {}) {
 		checksGracePolls: options.checksGracePolls ?? 2,
 		maxFixRounds: options.maxFixRounds ?? 2,
 		maxWatchMs: options.maxWatchMs ?? 60_000,
+		mergePollMs: options.mergePollMs ?? 20,
+		mergeWatchMs: options.mergeWatchMs ?? 60_000,
 		llm: options.llm,
 		modelSelection: options.llm ? () => ({ provider: "stub", model: "stub-model" }) : () => undefined,
 		resolveAgent: (sessionId) =>
@@ -561,6 +566,74 @@ await test("refuses to resolve a repository without any input", async () => {
 		assert.equal(listed.status, 200);
 		assert.ok(listed.payload.runs.length >= 1);
 	});
+	launcher.shutdown();
+	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
+}
+
+// Merge watch: a `passed` run keeps a slow `gh pr view --json state` watch
+// alive; GitHub reporting MERGED flips the run to the terminal `merged`
+// status — the state that turns the browser pill violet.
+{
+	const project = await makeProject();
+	const launcher = makeLauncher({ llm: llmStub("feat(widget): go violet", "") });
+
+	await test("merge watch: passed -> MERGED flips the run to terminal merged", async () => {
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const created = await call(launcher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: "session-merged", root: project.root },
+		});
+		const passed = await waitFor(launcher, created.payload.id, ["passed"]);
+		assert.equal(passed.prNumber, 1);
+
+		// GitHub reports the merge on the next merge-watch poll.
+		await writeState(fakeStateDir, "view.json", {
+			url: "https://github.com/acme/widget/pull/1",
+			number: 1,
+			state: "MERGED",
+			mergedAt: "2026-02-06T12:00:00Z",
+		});
+		const merged = await waitFor(launcher, created.payload.id, ["merged"]);
+		assert.equal(merged.status, "merged");
+		assert.equal(merged.prNumber, 1);
+		assert.equal(merged.mergedAt, "2026-02-06T12:00:00Z");
+		assert.match(merged.note ?? "", /merged upstream at 2026-02-06T12:00:00Z/);
+
+		// Terminal means terminal: after the flip the poll stream goes quiet
+		// (tolerating one in-flight poll crossing the boundary).
+		const before = (await readCalls(fakeStateDir)).filter((line) =>
+			line.startsWith("pr view"),
+		).length;
+		await sleep(120);
+		const after = (await readCalls(fakeStateDir)).filter((line) =>
+			line.startsWith("pr view"),
+		).length;
+		assert.ok(after - before <= 1, `merge watch stops once merged (${after - before})`);
+	});
+
+	await test("merge watch: a PR closed unmerged stays on passed and stops watching", async () => {
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const created = await call(launcher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: "session-closed", root: project.root },
+		});
+		const passed = await waitFor(launcher, created.payload.id, ["passed"]);
+		assert.equal(passed.status, "passed");
+
+		await writeState(fakeStateDir, "view.json", {
+			url: passed.prUrl,
+			number: passed.prNumber,
+			state: "CLOSED",
+		});
+		// A couple of watch periods later the run must have settled on passed.
+		await sleep(120);
+		assert.equal(launcher.runRecord(created.payload.id).status, "passed");
+	});
+
 	launcher.shutdown();
 	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
 }

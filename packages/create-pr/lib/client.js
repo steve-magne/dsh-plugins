@@ -13,8 +13,10 @@
  * Clicking posts to the host pipeline and then polls `GET /create-pr/api/
  * runs/<id>` every few seconds, mirroring the host-side run status:
  * preparing → committing → pushing → creating → waiting-ci → fixing? →
- * passed | failed | expired | cancelled | error. The last run id per session
- * survives reloads through localStorage.
+ * passed | failed | expired | cancelled | error — and, while a `passed` PR
+ * waits on its slower merge watch, possibly on to `merged`, which turns the
+ * pill VIOLET. The last run id per session survives reloads through
+ * localStorage.
  *
  * The seat is a list slot, so unmounting this plugin restores the stock
  * composer exactly.
@@ -40,12 +42,14 @@ window.__ModuleLoader__.load({
 			".cpr-btn.busy{border-color:var(--dsw-alias-border-l3,#4a4a52);" +
 			"color:var(--dsw-alias-label-primary,#eee)}" +
 			".cpr-btn.ok{border-color:#2f9e63;color:#34c273}" +
+			".cpr-btn.merged{border-color:#8250df;color:#ab7df8}" +
 			".cpr-btn.warn{border-color:#b08a2e;color:#d9a53a}" +
 			".cpr-btn.fail{border-color:#a04040;color:#e05656}" +
 			".cpr-dot{width:7px;height:7px;border-radius:50%;flex:none;" +
 			"background:var(--dsw-alias-border-l3,#55555c)}" +
 			".cpr-dot.busy{background:#d9a53a;box-shadow:0 0 6px rgba(217,165,58,.6)}" +
 			".cpr-dot.ok{background:#34c273;box-shadow:0 0 6px rgba(52,194,115,.7)}" +
+			".cpr-dot.merged{background:#ab7df8;box-shadow:0 0 6px rgba(171,125,248,.7)}" +
 			".cpr-dot.fail{background:#e05656;box-shadow:0 0 6px rgba(224,86,86,.7)}" +
 			".cpr-label{letter-spacing:.02em}";
 		const tagId = "@dsh-plugins/create-pr/button.css";
@@ -64,6 +68,9 @@ window.__ModuleLoader__.load({
 		//#region api client
 		const API = "/create-pr/api";
 		const POLL_MS = 3000;
+		// Once CI is green the host keeps only its slower merge watch alive, so
+		// the pill polls at the same relaxed cadence while it sits on `passed`.
+		const MERGE_POLL_MS = 15_000;
 
 		async function apiFetch(path, options) {
 			let response;
@@ -100,6 +107,7 @@ window.__ModuleLoader__.load({
 		//#region helpers
 		const TERMINAL = new Set([
 			"passed",
+			"merged",
 			"failed",
 			"expired",
 			"cancelled",
@@ -137,6 +145,7 @@ window.__ModuleLoader__.load({
 
 		function toneOf(run) {
 			if (!run) return { className: "", dot: "" };
+			if (run.status === "merged") return { className: "merged", dot: "merged" };
 			if (run.status === "passed") return { className: "ok", dot: "ok" };
 			if (run.status === "fixing") return { className: "warn", dot: "busy" };
 			if (PIPELINE.has(run.status) || run.status === "waiting-ci") {
@@ -164,6 +173,8 @@ window.__ModuleLoader__.load({
 					return `${n} fix…`;
 				case "passed":
 					return `✓${n}`;
+				case "merged":
+					return `merged${n}`;
 				default:
 					return `⚠${n}`;
 			}
@@ -213,7 +224,12 @@ window.__ModuleLoader__.load({
 			}, [sessionId]);
 
 			react.useEffect(() => {
-				if (!run || TERMINAL.has(run.status)) return undefined;
+				// `passed` is terminal for the pipeline but NOT for this component:
+				// the host merge watch may still flip it to `merged`, so keep
+				// polling — slowly. Every other terminal status stops the poll.
+				if (!run || (TERMINAL.has(run.status) && run.status !== "passed")) {
+					return undefined;
+				}
 				let live = true;
 				const timer = window.setInterval(() => {
 					fetchRun(run.id)
@@ -221,12 +237,12 @@ window.__ModuleLoader__.load({
 							if (live && record) setRun(record);
 						})
 						.catch(() => {});
-				}, POLL_MS);
+				}, run.status === "passed" ? MERGE_POLL_MS : POLL_MS);
 				return () => {
 					live = false;
 					window.clearInterval(timer);
 				};
-			}, [run && run.id]);
+			}, [run && run.id, run && run.status]);
 
 			const active = run && !TERMINAL.has(run.status);
 			const click = () => {
@@ -247,7 +263,12 @@ window.__ModuleLoader__.load({
 			const label = labelOf(run);
 			const title = error ? `${titleOf(run)}\n\n${error}` : titleOf(run);
 
-			if (run && run.status === "passed" && run.prUrl && !busy) {
+			if (
+				run &&
+				(run.status === "passed" || run.status === "merged") &&
+				run.prUrl &&
+				!busy
+			) {
 				return react_jsx_runtime.jsxs(
 					"span",
 					{

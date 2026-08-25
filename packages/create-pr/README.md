@@ -63,6 +63,12 @@ tokens):
    `maxWatchMs` total watch, then `expired`. An empty rollup is tolerated for
    `checksGracePolls` polls before counting as "no checks" (`passed`).
 
+6. **Watch the merge.** Once CI is green (`passed`) a slower merge watch keeps
+   polling `gh pr view --json state`: when GitHub reports `MERGED`, the run
+   flips to terminal `merged` and the composer pill turns **violet**
+   (`merged #N`). A PR closed unmerged stops the watch quietly; `mergePollMs`
+   sets its period and `mergeWatchMs` its total budget.
+
 ## HTTP API (`/create-pr/api`, loopback-only)
 
 | Route | Purpose |
@@ -73,7 +79,9 @@ tokens):
 | `POST /runs/<id>/cancel` | stop the watchdog, mark `cancelled` |
 
 Run statuses: `preparing → checking → committing → pushing → creating →
-waiting-ci → fixing? → passed | failed | expired | cancelled | error`.
+waiting-ci → fixing? → passed | failed | expired | cancelled | error`. A run
+that reached `passed` can still move on to `merged` later, when GitHub reports
+the PR merged (the pill goes violet).
 
 ## Row config
 
@@ -89,6 +97,8 @@ waiting-ci → fixing? → passed | failed | expired | cancelled | error`.
         # checksGracePolls: 4        # empty-rollup tolerance
         # maxFixRounds: 2            # auto-fix wake budget
         # maxWatchMs: 1800000        # total watch budget
+        # mergePollMs: 60000         # merge-watch period once CI is green
+        # mergeWatchMs: 86400000     # total merge-watch budget
         # ghPath: /opt/homebrew/bin/gh
         # debug: true                # console.warn diagnostics
 ```
