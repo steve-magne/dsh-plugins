@@ -48,6 +48,32 @@ Two artifacts, both outside this repo:
 Then restart the harness — the web surface has **no config hot-reload**, so new
 entries mount at boot only. Uninstall = remove both artifacts + restart.
 
+## Marketplaces & npm publication
+
+This repo carries the GitHub topic
+[`dsh-plugin`](https://github.com/topics/dsh-plugin), which is what the
+emerging DSH marketplaces crawl: [dshfind](https://dshfind.com) syncs the topic
+daily, [deepseekplugin.org](https://deepseekplugin.org) indexes it, and verified
+registries such as [YELEBAI/dsh-plugin-marketplace](https://github.com/YELEBAI/dsh-plugin-marketplace)
+scan `topic:dsh-plugin` every two hours before validating manifests and loader
+entries for one-click install.
+
+Every package is independently publishable to npm under the `@dsh-plugins`
+scope. Each manifest points back here via `repository.directory`, so a
+marketplace listing deep-links straight to the plugin's subfolder, and its
+`keywords` open with `dsh-plugin` / `deepseek-harness` for npm-search-based
+discovery. Publishing one plugin (requires owning the `@dsh-plugins` scope on
+npmjs.com):
+
+```bash
+cd packages/command-deck
+npm publish                                   # publishConfig already forces public access
+git tag command-deck-v0.1.0 && git push origin command-deck-v0.1.0   # registries pin exact refs
+```
+
+Tag releases as `<package>-v<version>` so GitHub-source installs can be pinned
+to a precise ref instead of a moving `main`.
+
 ## Tests
 
 Each plugin is self-tested without cordis (stubbed services over real
@@ -57,5 +83,25 @@ subprocesses / a stubbed browser surface):
 pnpm test    # runs every package's suites
 ```
 
+## Pre-commit guard
+
+Every commit passes through [`scripts/marketplace-guard.mjs`](scripts/marketplace-guard.mjs)
+(via `.githooks/pre-commit`, activate on a fresh clone with
+`git config core.hooksPath .githooks`). It guarantees that the files the DSH
+scan and the marketplaces read are present — per-plugin `package.json`,
+`README.md`, `lib/index.js`, `lib/client.js`; root `LICENSE.md`,
+`pnpm-workspace.yaml`, listing rows in this README — normalizes every manifest
+to the canonical marketplace shape (`repository.directory`, keywords prefix,
+`files` whitelist, `publishConfig`, exports contract), re-stages what it
+repaired (staged files only, never sweeps unrelated work-in-progress), checks
+the three-way identity package name ↔ client registration id, and runs
+`node --check` over each shipped `lib/*.js`. Anything it cannot derive is
+reported as a hard error instead of being scaffolded. Run it standalone with
+`node scripts/marketplace-guard.mjs [--fix]`.
+
 See [AGENTS.md](AGENTS.md) for the architecture contract every plugin here
 must follow.
+
+## License
+
+[MIT](LICENSE.md).

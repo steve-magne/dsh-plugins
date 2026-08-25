@@ -1,19 +1,49 @@
 {
 	"name": "@dsh-plugins/scheduled-tasks",
 	"version": "0.1.0",
-	"private": true,
-	"type": "module",
 	"description": "DSH web plugin: cron-scheduled prompts — a Scheduled Tasks page in the Settings modal (workspace, model, cron, prompt); each firing runs one unattended LLM iteration in an isolated worktree cut from up-to-date main and opens a GitHub pull request",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"cron",
+		"scheduling",
+		"automation"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/scheduled-tasks#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/scheduled-tasks"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
+	"type": "module",
+	"main": "./lib/index.js",
 	"exports": {
 		".": "./lib/index.js",
 		"./client": "./lib/client.js",
 		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
 	},
 	"dsh": {
 		"client": {
 			"platform": "web",
 			"inject": []
 		}
-	},
-	"license": "MIT"
+	}
 }

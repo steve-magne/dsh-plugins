@@ -30,6 +30,12 @@
  *     watching the same PR and flips to `passed` once CI is green (bounded by
  *     `maxFixRounds` auto-fix rounds and `maxWatchMs`).
  *
+ *   - a MERGE WATCH then keeps a slower poll of
+ *     `gh pr view --json state` while the run sits on `passed`: when GitHub
+ *     reports `MERGED` the run flips to the terminal `merged` status (the
+ *     browser pill turns violet). A PR closed unmerged stops the watch
+ *     quietly; the watch itself expires after `mergeWatchMs`.
+ *
  * HTTP surface: a small loopback-only JSON API under `/create-pr/api`
  * (POST /create, GET /runs, GET /runs/<id>, POST /runs/<id>/cancel).
  *
@@ -56,6 +62,8 @@ const DEFAULT_POLL_MS = 15_000;
 const DEFAULT_GRACE_POLLS = 4;
 const DEFAULT_MAX_FIX_ROUNDS = 2;
 const DEFAULT_MAX_WATCH_MS = 30 * 60_000;
+const DEFAULT_MERGE_POLL_MS = 60_000;
+const DEFAULT_MERGE_WATCH_MS = 24 * 60 * 60_000;
 
 /** LLM input/output budgets — the token frugality contract of this plugin. */
 const DIFF_MAX_CHARS = 12_000;
@@ -65,9 +73,10 @@ const PR_MAX_TOKENS = 500;
 
 const BASE_BRANCHES = new Set(["main", "master"]);
 
-/** Terminal run statuses: the client stops polling on any of these. */
+/** Terminal run statuses: the client stops its pipeline polling on these. */
 export const TERMINAL_STATUSES = new Set([
 	"passed",
+	"merged",
 	"failed",
 	"expired",
 	"cancelled",
@@ -424,6 +433,8 @@ export function extractPrUrl(text) {
  * @param {number} [deps.checksGracePolls] - empty-rollup polls tolerated before "no checks".
  * @param {number} [deps.maxFixRounds] - automatic followup wake budget per run.
  * @param {number} [deps.maxWatchMs] - total watchdog budget per run.
+ * @param {number} [deps.mergePollMs] - merge-watch period once CI is green.
+ * @param {number} [deps.mergeWatchMs] - total merge-watch budget per run.
  * @param {string} [deps.ghPath] - explicit gh executable (default: resolve "gh").
  * @param {{stream?: Function}} [deps.llm] - optional ctx.llm (streaming model calls).
  * @param {() => ({provider: string, model: string}|undefined)} [deps.modelSelection].
@@ -459,6 +470,14 @@ export function createPrLauncher(deps) {
 		typeof deps.maxWatchMs === "number" && deps.maxWatchMs > 0
 			? deps.maxWatchMs
 			: DEFAULT_MAX_WATCH_MS;
+	const mergePollMs =
+		typeof deps.mergePollMs === "number" && deps.mergePollMs > 0
+			? deps.mergePollMs
+			: DEFAULT_MERGE_POLL_MS;
+	const mergeWatchMs =
+		typeof deps.mergeWatchMs === "number" && deps.mergeWatchMs > 0
+			? deps.mergeWatchMs
+			: DEFAULT_MERGE_WATCH_MS;
 	const llm = typeof deps.llm?.stream === "function" ? deps.llm : undefined;
 	const modelSelection =
 		typeof deps.modelSelection === "function" ? deps.modelSelection : () => undefined;
@@ -806,6 +825,7 @@ export function createPrLauncher(deps) {
 			commitSubject: record.commitSubject ?? null,
 			checks: Array.isArray(record.checks) ? record.checks.slice(-20) : [],
 			fixRounds: record.fixRounds ?? 0,
+			mergedAt: record.mergedAt ?? null,
 			note: record.note ?? null,
 			error: record.error ?? null,
 			createdAt: record.createdAt,
@@ -1016,8 +1036,72 @@ export function createPrLauncher(deps) {
 		cancelTimeout(watchers.get(record.id));
 		watchers.delete(record.id);
 		record.status = status;
+		if (status === "passed") record.passedAt = Date.now();
 		record.note = note ?? record.note ?? null;
 		record.updatedAt = Date.now();
+		// Every path that lands on `passed` (green rollup, no-checks grace, or a
+		// recovered auto-fix) arms the slower merge watch from this one spot.
+		if (status === "passed") scheduleMergeWatch(record, mergePollMs);
+	}
+
+	/**
+	 * Post-`passed` merge watch: a slower poll of `gh pr view --json state`.
+	 * `MERGED` flips the run to the terminal `merged` status; a PR closed
+	 * unmerged stops the watch quietly; the watch itself expires after
+	 * `mergeWatchMs`. Reuses the same watcher slot as the CI watchdog, so
+	 * cancel/shutdown semantics stay identical.
+	 */
+	function scheduleMergeWatch(record, delayMs) {
+		if (!runs.has(record.id) || record.status !== "passed") return;
+		cancelTimeout(watchers.get(record.id));
+		watchers.set(
+			record.id,
+			scheduleTimeout(() => {
+				void Promise.resolve()
+					.then(() => pollMerged(record.id))
+					.catch((error) => {
+						warn(`create-pr: merge watch crashed: ${error?.message ?? error}`);
+						scheduleMergeWatch(record, delayMs);
+					});
+			}, delayMs),
+		);
+	}
+
+	async function pollMerged(runId) {
+		const record = runs.get(runId);
+		if (!record || record.status !== "passed") return;
+		if (Date.now() - (record.passedAt ?? Date.now()) > mergeWatchMs) return;
+		let view;
+		try {
+			view = await ghJson([
+				"pr",
+				"view",
+				String(record.prNumber),
+				"-R",
+				`${record.slug.owner}/${record.slug.repo}`,
+				"--json",
+				"state,url,number,mergedAt",
+			]);
+		} catch (error) {
+			record.note = oneLine(error.message).slice(0, 300);
+			scheduleMergeWatch(record, mergePollMs);
+			return;
+		}
+		if (
+			view?.url &&
+			(typeof view.number !== "number" || view.number === record.prNumber)
+		) {
+			record.prUrl = view.url;
+		}
+		const state = String(view?.state ?? "").toUpperCase();
+		if (state === "MERGED") {
+			record.mergedAt =
+				typeof view.mergedAt === "string" && view.mergedAt ? view.mergedAt : null;
+			finishRun(record, "merged", record.mergedAt ? `merged upstream at ${record.mergedAt}` : "merged upstream");
+			return;
+		}
+		if (state === "CLOSED") return; // closed without merging: nothing left to watch
+		scheduleMergeWatch(record, mergePollMs);
 	}
 
 	function startWatching(record) {
@@ -1312,7 +1396,8 @@ export function createPrLauncher(deps) {
  * @param {object} ctx - host cordis context (`webServer` + `subprocess` injected).
  * @param {object} [config] - row config
  *   `{ cwd?, baseBranch?, draft?, pollIntervalMs?, checksGracePolls?,
- *      maxFixRounds?, maxWatchMs?, ghPath?, debug? }`.
+ *      maxFixRounds?, maxWatchMs?, mergePollMs?, mergeWatchMs?, ghPath?,
+ *      debug? }`.
  */
 export function apply(ctx, config) {
 	const options = config ?? {};
@@ -1344,6 +1429,8 @@ export function apply(ctx, config) {
 			typeof options.checksGracePolls === "number" ? options.checksGracePolls : undefined,
 		maxFixRounds: typeof options.maxFixRounds === "number" ? options.maxFixRounds : undefined,
 		maxWatchMs: typeof options.maxWatchMs === "number" ? options.maxWatchMs : undefined,
+		mergePollMs: typeof options.mergePollMs === "number" ? options.mergePollMs : undefined,
+		mergeWatchMs: typeof options.mergeWatchMs === "number" ? options.mergeWatchMs : undefined,
 		ghPath: typeof options.ghPath === "string" ? options.ghPath : undefined,
 		llm: ctx.get("llm") ?? undefined,
 		modelSelection: () => {

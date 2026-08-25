@@ -113,7 +113,14 @@ edit the patch row, restart the harness.
    against real child processes; client-half suite executes the factory in a
    VM with stub React/DOM and asserts the slot contract). Plus
    `node --check lib/*.js`.
-4. Commits follow Conventional Commits (`feat:`, `fix:`, `docs:`).
+4. The pre-commit hook (`.githooks/pre-commit` →
+   `scripts/marketplace-guard.mjs`; activate with
+   `git config core.hooksPath .githooks`) enforces the packaging contract:
+   required files present, manifests canonical (`repository.directory`,
+   keywords prefix, exports incl. `"./package.json"`, …), package name ↔
+   client registration id identical, `node --check` green. It auto-repairs
+   staged manifests; treat its ✗ reports as blocking.
+5. Commits follow Conventional Commits (`feat:`, `fix:`, `docs:`).
 
 ## Security posture
 
