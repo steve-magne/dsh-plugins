@@ -174,7 +174,6 @@ export function createIssueStarter(deps) {
 		const outcome = await handle.done;
 		const out = readAll(handle, "stdout");
 		const err = readAll(handle, "stderr");
-		void options;
 		return { code: outcome.exitCode ?? 1, out, err };
 	}
 
