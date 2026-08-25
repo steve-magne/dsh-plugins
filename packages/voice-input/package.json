@@ -1,0 +1,51 @@
+{
+	"name": "@dsh-plugins/voice-input",
+	"version": "0.1.0",
+	"description": "DeepSeek Harness plugin: on-device voice dictation for the web surface — a mic toggle in the composer that transcribes locally through the browser Speech API or a loopback-only local ASR endpoint (whisper.cpp style)",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"web-ui",
+		"voice",
+		"dictation",
+		"speech-to-text",
+		"whisper"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/voice-input#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/voice-input"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
+	"type": "module",
+	"main": "./lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"dsh": {
+		"client": {
+			"platform": "web",
+			"inject": []
+		}
+	}
+}
