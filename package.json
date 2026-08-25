@@ -9,7 +9,7 @@
 		"url": "git+https://github.com/steve-magne/dsh-plugins.git"
 	},
 	"scripts": {
-		"test": "node packages/command-deck/test/run.mjs && node packages/command-deck/test/client-check.mjs && node packages/worktree-launcher/test/run.mjs && node packages/worktree-launcher/test/client-check.mjs && node packages/create-pr/test/run.mjs && node packages/create-pr/test/client-check.mjs && node packages/scheduled-tasks/test/unit.mjs && node packages/scheduled-tasks/test/run.mjs && node packages/scheduled-tasks/test/client-check.mjs"
+		"test": "node packages/command-deck/test/run.mjs && node packages/command-deck/test/client-check.mjs && node packages/worktree-launcher/test/run.mjs && node packages/worktree-launcher/test/client-check.mjs && node packages/create-pr/test/run.mjs && node packages/create-pr/test/client-check.mjs && node packages/scheduled-tasks/test/unit.mjs && node packages/scheduled-tasks/test/run.mjs && node packages/scheduled-tasks/test/client-check.mjs && node packages/agent-terminal/test/run.mjs && node packages/agent-terminal/test/client-check.mjs && node packages/voice-input/test/run.mjs && node packages/voice-input/test/client-check.mjs && node packages/issue-starter/test/run.mjs && node packages/issue-starter/test/client-check.mjs"
 	},
 	"license": "MIT"
 }

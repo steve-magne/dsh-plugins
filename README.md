@@ -14,6 +14,9 @@ releases or inherit product quality gates.
 | [`@dsh-plugins/worktree-launcher`](packages/worktree-launcher/) | One isolated git worktree (`<repo>/.dsh/worktrees/dsh-word-word-word`, based on an up-to-date main) materialized for every new chat session, with an ON-by-default toggle in the composer |
 | [`@dsh-plugins/create-pr`](packages/create-pr/) | One-click GitHub PR from a "Create PR" button beside the Worktree toggle: deterministic git/gh plumbing, one LLM call for the conventional-commit message, and a CI watchdog that wakes the owning session to fix failures |
 | [`@dsh-plugins/scheduled-tasks`](packages/scheduled-tasks/) | "Scheduled Tasks" page in the Settings modal: cron-scheduled prompts (workspace, model, cron, prompt) where each firing cuts an isolated worktree from up-to-date main, runs one unattended LLM iteration inside it, then pushes the branch and opens a GitHub PR |
+| [`@dsh-plugins/agent-terminal`](packages/agent-terminal/) | "Agent Terminal" overlay: interactive takeover console — allocate terminals on the harness host (PTY when available), watch their live output, type into them, interrupt them |
+| [`@dsh-plugins/voice-input`](packages/voice-input/) | Mic toggle in the composer tool row: on-device voice dictation through the browser Speech API or a loopback-only local ASR server (whisper.cpp style) |
+| [`@dsh-plugins/issue-starter`](packages/issue-starter/) | "Issues → Sessions" overlay: preview a GitHub issue, cut an isolated worktree from an up-to-date base, and launch a live agent session scoped to it (nudge included) |
 
 ## Repository layout
 
