@@ -48,6 +48,32 @@ Two artifacts, both outside this repo:
 Then restart the harness — the web surface has **no config hot-reload**, so new
 entries mount at boot only. Uninstall = remove both artifacts + restart.
 
+## Marketplaces & npm publication
+
+This repo carries the GitHub topic
+[`dsh-plugin`](https://github.com/topics/dsh-plugin), which is what the
+emerging DSH marketplaces crawl: [dshfind](https://dshfind.com) syncs the topic
+daily, [deepseekplugin.org](https://deepseekplugin.org) indexes it, and verified
+registries such as [YELEBAI/dsh-plugin-marketplace](https://github.com/YELEBAI/dsh-plugin-marketplace)
+scan `topic:dsh-plugin` every two hours before validating manifests and loader
+entries for one-click install.
+
+Every package is independently publishable to npm under the `@dsh-plugins`
+scope. Each manifest points back here via `repository.directory`, so a
+marketplace listing deep-links straight to the plugin's subfolder, and its
+`keywords` open with `dsh-plugin` / `deepseek-harness` for npm-search-based
+discovery. Publishing one plugin (requires owning the `@dsh-plugins` scope on
+npmjs.com):
+
+```bash
+cd packages/command-deck
+npm publish                                   # publishConfig already forces public access
+git tag command-deck-v0.1.0 && git push origin command-deck-v0.1.0   # registries pin exact refs
+```
+
+Tag releases as `<package>-v<version>` so GitHub-source installs can be pinned
+to a precise ref instead of a moving `main`.
+
 ## Tests
 
 Each plugin is self-tested without cordis (stubbed services over real
@@ -59,3 +85,7 @@ pnpm test    # runs every package's suites
 
 See [AGENTS.md](AGENTS.md) for the architecture contract every plugin here
 must follow.
+
+## License
+
+[MIT](LICENSE.md).

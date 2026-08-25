@@ -1,19 +1,48 @@
 {
 	"name": "@dsh-plugins/worktree-launcher",
 	"version": "0.1.0",
-	"private": true,
-	"type": "module",
 	"description": "DSH web plugin: one isolated git worktree (branch dsh-word-word-word, based on an up-to-date main) materialized for every new chat session",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"git",
+		"worktree"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/worktree-launcher#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/worktree-launcher"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
+	"type": "module",
+	"main": "./lib/index.js",
 	"exports": {
 		".": "./lib/index.js",
 		"./client": "./lib/client.js",
 		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
 	},
 	"dsh": {
 		"client": {
 			"platform": "web",
 			"inject": []
 		}
-	},
-	"license": "MIT"
+	}
 }

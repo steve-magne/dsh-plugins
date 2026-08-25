@@ -1,20 +1,49 @@
 {
 	"name": "@dsh-plugins/command-deck",
-	"description": "DeepSeek Harness plugin: a right-docked Command Deck sidebar for the web surface — save shell commands, run them on the host, stream their output, stop them with one click",
 	"version": "0.1.0",
+	"description": "DeepSeek Harness plugin: a right-docked Command Deck sidebar for the web surface — save shell commands, run them on the host, stream their output, stop them with one click",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"web-ui",
+		"shell",
+		"command-runner"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/command-deck#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/command-deck"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
 	"type": "module",
-	"main": "lib/index.js",
+	"main": "./lib/index.js",
 	"exports": {
 		".": "./lib/index.js",
 		"./client": "./lib/client.js",
 		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
 	},
 	"dsh": {
 		"client": {
 			"platform": "web",
 			"inject": []
 		}
-	},
-	"private": true,
-	"license": "MIT"
+	}
 }
