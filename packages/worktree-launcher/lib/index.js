@@ -14,10 +14,16 @@
  *     based on an up-to-date main (best-effort `git fetch` + fast-forward —
  *     never an unsafe pull), with `main` left untouched when checked out;
  *   - a scoped system-prompt section tells the model to work inside that
- *     worktree for the whole session.
+ *     worktree for the whole session;
+ *   - a session-list status endpoint joins every bound record with its
+ *     session's display title and the GitHub PR state of its branch
+ *     (`gh pr view <branch>`), so the browser half can paint a git logo
+ *     beside each sidebar session row: green = worktree created, blue = PR
+ *     open, red = CI failing (or PR closed unmerged), purple = merged.
  *
  * HTTP surface: a small loopback-only JSON API under `/worktree-launcher/api`
- * (preference get/set, create, list, per-session lookup, remove).
+ * (preference get/set, create, list, per-session lookup, remove, and the
+ * per-session git/PR state feed).
  *
  * Trust posture matches @dsh-plugins/command-deck: the harness web server
  * binds loopback without auth by design; this surface adds a Host allowlist
@@ -43,6 +49,153 @@ export const BRANCH_PATTERN = /^dsh-[a-z]{3,12}-[a-z]{3,12}-[a-z]{3,12}$/;
 const WORKTREE_DIR_PARTS = [".dsh", "worktrees"];
 const IGNORE_PATH = ".dsh/worktrees";
 const IGNORE_LINE = `${IGNORE_PATH}/`;
+
+/** Session-title cache TTL for the badge feed (`session-states`). */
+const TITLE_TTL_MS = 30_000;
+/** How often a missing `gh` binary is probed again before giving up. */
+const GH_PROBE_RETRY_MS = 5 * 60_000;
+
+/**
+ * Check-conclusion vocabularies shared with @dsh-plugins/create-pr (duplicated
+ * on purpose: plugins never import each other). Anything not explicitly good
+ * or bad is treated as still running.
+ */
+const BAD_CHECK_CONCLUSIONS = new Set([
+	"FAILURE",
+	"TIMED_OUT",
+	"STARTUP_FAILURE",
+	"ACTION_REQUIRED",
+	"CANCELLED",
+	"ERROR",
+]);
+const GOOD_CHECK_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+
+/**
+ * Normalize one `statusCheckRollup` entry (CheckRun, StatusContext, or
+ * WorkflowRun shapes) into `{name, conclusion}`.
+ */
+export function normalizeCheck(entry) {
+	if (!entry || typeof entry !== "object") {
+		return { name: "check", conclusion: "UNKNOWN" };
+	}
+	const rawStatus = String(entry.status ?? "").toUpperCase();
+	const rawState = String(entry.state ?? "").toUpperCase();
+	let conclusion = String(entry.conclusion ?? "").toUpperCase();
+	if (!conclusion) {
+		if (rawState === "SUCCESS") conclusion = "SUCCESS";
+		else if (rawState === "FAILURE" || rawState === "ERROR") conclusion = "FAILURE";
+		else if (rawState === "PENDING" || rawState === "EXPECTED") conclusion = "PENDING";
+		else if (
+			rawStatus === "IN_PROGRESS" ||
+			rawStatus === "QUEUED" ||
+			rawStatus === "PENDING" ||
+			rawStatus === "WAITING"
+		) {
+			conclusion = "PENDING";
+		} else conclusion = rawStatus || rawState ? "PENDING" : "UNKNOWN";
+	}
+	return {
+		name: String(entry.name ?? entry.context ?? entry.workflowName ?? "check"),
+		conclusion,
+	};
+}
+
+/**
+ * Classify a full rollup snapshot: `failed` wins over pending; an empty
+ * rollup is `empty` (checks not registered yet — counts as healthy here).
+ */
+export function classifyChecks(rollup) {
+	const entries = Array.isArray(rollup) ? rollup : [];
+	const checks = entries.map(normalizeCheck);
+	if (checks.length === 0) return { outcome: "empty", checks };
+	let failed = false;
+	let pending = false;
+	for (const check of checks) {
+		if (BAD_CHECK_CONCLUSIONS.has(check.conclusion)) failed = true;
+		else if (!GOOD_CHECK_CONCLUSIONS.has(check.conclusion)) pending = true;
+	}
+	if (failed) return { outcome: "failed", checks };
+	if (pending) return { outcome: "pending", checks };
+	return { outcome: "passed", checks };
+}
+
+/**
+ * Map one normalized PR view onto the session-list badge state:
+ *   - no PR at all                        -> `created` (green)
+ *   - MERGED                              -> `merged`  (purple)
+ *   - CLOSED without a merge              -> `problem` (red)
+ *   - OPEN with a failed check            -> `problem` (red)
+ *   - OPEN otherwise (passing/pending/no) -> `pr`      (blue)
+ */
+export function deriveBadgeState(pr) {
+	if (!pr || typeof pr !== "object") return "created";
+	const state = String(pr.state ?? "").toUpperCase();
+	if (state === "MERGED") return "merged";
+	if (state === "CLOSED") return "problem";
+	if (classifyChecks(pr.statusCheckRollup).outcome === "failed") return "problem";
+	return "pr";
+}
+
+function firstTitleString(value, depth = 0) {
+	if (typeof value === "string") return value.trim() ? value.trim() : undefined;
+	if (!value || typeof value !== "object" || depth > 2) return undefined;
+	for (const candidate of [value.title, value.displayTitle]) {
+		const picked = firstTitleString(candidate, depth + 1);
+		if (picked) return picked;
+	}
+	if (value.snapshot) return firstTitleString(value.snapshot, depth + 1);
+	return undefined;
+}
+
+/**
+ * Build the `listSessionTitles(ids) -> [{sessionId, title}]` dependency from
+ * the optional host `sessionQuery` service. The service face grew over
+ * releases, so the lister tries `readTitleSnapshots` first and falls back to
+ * one `listSessions()` sweep, tolerantly extracting titles from either shape.
+ * When the service is absent entirely the lister answers empty and the browser
+ * badges simply stay hidden.
+ * @param {object|undefined} sessionQuery - ctx.get("sessionQuery").
+ * @param {object} [options]
+ * @param {(message: string) => void} [options.warn] - best-effort diagnostics sink.
+ */
+export function createSessionTitleLister(sessionQuery, options = {}) {
+	const warn = typeof options.warn === "function" ? options.warn : () => {};
+	if (sessionQuery && typeof sessionQuery.readTitleSnapshots === "function") {
+		return async (ids) => {
+			const observations = await sessionQuery.readTitleSnapshots(ids);
+			const pairs = [];
+			const list = Array.isArray(observations) ? observations : [];
+			for (let index = 0; index < list.length; index += 1) {
+				const entry = list[index];
+				const sessionId =
+					entry && typeof entry === "object" && typeof entry.sessionId === "string"
+						? entry.sessionId
+						: ids[index];
+				const title = firstTitleString(entry);
+				if (sessionId && title) pairs.push({ sessionId, title });
+			}
+			return pairs;
+		};
+	}
+	if (sessionQuery && typeof sessionQuery.listSessions === "function") {
+		return async (ids) => {
+			const wanted = new Set(ids);
+			const records = await sessionQuery.listSessions();
+			const pairs = [];
+			for (const record of Array.isArray(records) ? records : []) {
+				const sessionId = record ? record.sessionId ?? record.id : undefined;
+				if (typeof sessionId !== "string" || !wanted.has(sessionId)) continue;
+				const title =
+					firstTitleString(record) ??
+					firstTitleString(record?.projections?.title);
+				if (title) pairs.push({ sessionId, title });
+			}
+			return pairs;
+		};
+	}
+	warn("worktree-launcher: no usable sessionQuery service; session-list badges stay hidden");
+	return async () => [];
+}
 
 /** Word pools for the `dsh-word-word-word` branch naming (letters only). */
 const ADJECTIVES = [
@@ -98,6 +251,12 @@ function oneLine(text) {
  * @param {boolean} [deps.enabled] - initial value of the auto-worktree preference.
  * @param {() => number} [deps.random] - randomness source for word picking.
  * @param {(adjectives: string[], nouns: string[], random: () => number) => string[]} [deps.wordPicker].
+ * @param {string} [deps.ghPath] - explicit `gh` binary path instead of PATH resolution.
+ * @param {number} [deps.prTtlMs] - PR-status cache TTL per branch (default 60 s).
+ * @param {number} [deps.ghTimeoutMs] - budget for one `gh pr view` call (default 10 s).
+ * @param {(ids: string[]) => Promise<Array<{sessionId: string, title: string}>>} [deps.listSessionTitles]
+ *   - session-id -> display-title source for the badge feed (built from the
+ *     optional sessionQuery service; absent -> badges stay hidden).
  * @param {(message: string) => void} [deps.warn] - sink for best-effort failures.
  */
 export function createWorktreeLauncher(deps) {
@@ -115,6 +274,14 @@ export function createWorktreeLauncher(deps) {
 		typeof deps.fetchTimeoutMs === "number" && deps.fetchTimeoutMs > 0
 			? deps.fetchTimeoutMs
 			: DEFAULT_FETCH_TIMEOUT_MS;
+	const ghPath =
+		typeof deps.ghPath === "string" && deps.ghPath.trim() ? deps.ghPath.trim() : undefined;
+	const prTtlMs =
+		typeof deps.prTtlMs === "number" && deps.prTtlMs > 0 ? deps.prTtlMs : 60_000;
+	const ghTimeoutMs =
+		typeof deps.ghTimeoutMs === "number" && deps.ghTimeoutMs > 0 ? deps.ghTimeoutMs : 10_000;
+	const listSessionTitles =
+		typeof deps.listSessionTitles === "function" ? deps.listSessionTitles : undefined;
 	const random = typeof deps.random === "function" ? deps.random : Math.random;
 	const wordPicker =
 		typeof deps.wordPicker === "function" ? deps.wordPicker : defaultWordPicker;
@@ -130,25 +297,30 @@ export function createWorktreeLauncher(deps) {
 	/** One in-flight creation chain per repo top, serializing git mutations. */
 	const chains = new Map();
 
-	let executablePromise;
-	async function gitExecutable() {
-		if (!executablePromise) {
-			executablePromise = resolveExecutable("git").catch((error) => {
-				executablePromise = undefined;
-				throw error;
-			});
+	/** Resolved-binary cache keyed by kind ("git" | "gh"); failed lookups retry. */
+	const executables = new Map();
+	async function executable(kind) {
+		if (!executables.has(kind)) {
+			const wanted = kind === "gh" && ghPath ? ghPath : kind;
+			executables.set(
+				kind,
+				resolveExecutable(wanted).catch((error) => {
+					executables.delete(kind);
+					throw error;
+				}),
+			);
 		}
-		return executablePromise;
+		return executables.get(kind);
 	}
 
 	// ------------------------------------------------------------------ git
 
-	async function runGit(argv, options = {}) {
+	async function runProc(kind, argv, options = {}) {
 		const cwd = options.cwd;
 		const timeoutMs = options.timeoutMs ?? GIT_TIMEOUT_MS;
-		const executable = await gitExecutable();
+		const bin = await executable(kind);
 		const handle = spawn({
-			argv: [executable, ...argv],
+			argv: [bin, ...argv],
 			cwd,
 			stdio: {
 				stdin: "ignore",
@@ -169,7 +341,7 @@ export function createWorktreeLauncher(deps) {
 			clearTimeout(timer);
 		}
 		if (timedOut) {
-			throw new Error(`git ${argv[0]} timed out after ${timeoutMs}ms`);
+			throw new Error(`${kind} ${argv[0]} timed out after ${timeoutMs}ms`);
 		}
 		const readAll = (stream) => {
 			const reader = handle.collected?.[stream];
@@ -180,6 +352,10 @@ export function createWorktreeLauncher(deps) {
 			out: readAll("stdout").trim(),
 			err: readAll("stderr").trim(),
 		};
+	}
+
+	async function runGit(argv, options = {}) {
+		return runProc("git", argv, options);
 	}
 
 	async function revParse(revision, cwd) {
@@ -565,6 +741,130 @@ export function createWorktreeLauncher(deps) {
 		return branch ? records.get(branch) : undefined;
 	}
 
+	// ------------------------------------------------- session badge states
+
+	/** Tri-state probe result: "unknown" | "available" | "missing". */
+	let ghProbe = { state: "unknown", at: 0 };
+
+	async function ghReady() {
+		const now = Date.now();
+		if (ghProbe.state === "available") return true;
+		if (ghProbe.state === "missing" && now - ghProbe.at < GH_PROBE_RETRY_MS) {
+			return false;
+		}
+		try {
+			await executable("gh");
+			ghProbe = { state: "available", at: now };
+			return true;
+		} catch {
+			ghProbe = { state: "missing", at: now };
+			warn("worktree-launcher: gh is unavailable; PR badges degrade to 'created'");
+			return false;
+		}
+	}
+
+	/** One normalized `gh pr view` snapshot, or null when GitHub has no PR. */
+	async function fetchPrStatus(record) {
+		if (!(await ghReady())) return null;
+		let view;
+		try {
+			const result = await runProc(
+				"gh",
+				["pr", "view", record.branch, "--json", "number,url,state,statusCheckRollup"],
+				{ cwd: record.root, timeoutMs: ghTimeoutMs },
+			);
+			if (result.code !== 0) return null;
+			view = JSON.parse(result.out);
+		} catch (error) {
+			warn(`worktree-launcher: gh pr view failed for ${record.branch}: ${error?.message ?? error}`);
+			return null;
+		}
+		if (!view || typeof view !== "object") return null;
+		return {
+			number: typeof view.number === "number" ? view.number : null,
+			url: typeof view.url === "string" ? view.url : null,
+			state: String(view.state ?? "").toUpperCase(),
+			statusCheckRollup: Array.isArray(view.statusCheckRollup)
+				? view.statusCheckRollup
+				: [],
+		};
+	}
+
+	/** branch -> {at, pr}; pr is null when GitHub has none for the branch. */
+	const prCache = new Map();
+	let prChain = Promise.resolve();
+
+	function prStatusFor(branch) {
+		const fresh = prCache.get(branch);
+		if (fresh && Date.now() - fresh.at < prTtlMs) return Promise.resolve(fresh.pr);
+		const record = records.get(branch);
+		if (!record) return Promise.resolve(null);
+		const run = prChain.catch(() => {}).then(async () => {
+			const cached = prCache.get(branch);
+			if (cached && Date.now() - cached.at < prTtlMs) return cached.pr;
+			const pr = await fetchPrStatus(record);
+			prCache.set(branch, { at: Date.now(), pr });
+			return pr;
+		});
+		prChain = run.catch(() => {});
+		return run;
+	}
+
+	/** sessionId -> display title, refreshed at most every TITLE_TTL_MS. */
+	let titleCache = { at: 0, byId: new Map() };
+
+	async function sessionTitles(ids) {
+		if (!listSessionTitles || ids.length === 0) return new Map();
+		const now = Date.now();
+		if (now - titleCache.at < TITLE_TTL_MS) return titleCache.byId;
+		try {
+			const pairs = await listSessionTitles(ids);
+			const byId = new Map();
+			for (const pair of Array.isArray(pairs) ? pairs : []) {
+				if (
+					pair &&
+					typeof pair.sessionId === "string" &&
+					typeof pair.title === "string" &&
+					pair.title.trim()
+				) {
+					byId.set(pair.sessionId, pair.title.trim());
+				}
+			}
+			titleCache = { at: now, byId };
+			return byId;
+		} catch (error) {
+			warn(`worktree-launcher: session titles unavailable: ${error?.message ?? error}`);
+			return titleCache.at ? titleCache.byId : new Map();
+		}
+	}
+
+	/**
+	 * Badge feed for the browser half: one entry per bound worktree whose
+	 * session title resolved — exactly what a sidebar row needs to paint its
+	 * git logo between the title and the relative-time label.
+	 */
+	async function sessionStates() {
+		const snapshot = listWorktrees();
+		const ids = [...new Set(snapshot.map((entry) => entry.sessionId).filter(Boolean))];
+		const titles = await sessionTitles(ids);
+		const states = [];
+		for (const record of snapshot) {
+			if (!record.sessionId) continue;
+			const title = titles.get(record.sessionId);
+			if (!title) continue;
+			const pr = await prStatusFor(record.branch);
+			states.push({
+				sessionId: record.sessionId,
+				title,
+				state: deriveBadgeState(pr),
+				branch: record.branch,
+				prNumber: pr ? pr.number : null,
+				prUrl: pr ? pr.url : null,
+			});
+		}
+		return states;
+	}
+
 	// ------------------------------------------------------- agent wiring
 
 	/**
@@ -722,6 +1022,10 @@ export function createWorktreeLauncher(deps) {
 				sendJson(res, 200, { worktrees: listWorktrees(), enabled: pref.enabled });
 				return;
 			}
+			if (method === "GET" && pathname === `${API_PREFIX}/session-states`) {
+				sendJson(res, 200, { states: await sessionStates() });
+				return;
+			}
 			const sessionMatch = pathname.match(/^\/worktree-launcher\/api\/by-session\/(.+)$/);
 			if (method === "GET" && sessionMatch) {
 				const sessionId = decodeURIComponent(sessionMatch[1]);
@@ -765,6 +1069,8 @@ export function createWorktreeLauncher(deps) {
 		bySession.clear();
 		eligible.clear();
 		chains.clear();
+		prCache.clear();
+		titleCache = { at: 0, byId: new Map() };
 	}
 
 	return {
@@ -780,6 +1086,8 @@ export function createWorktreeLauncher(deps) {
 		removeWorktree,
 		listWorktrees,
 		recordForSession,
+		sessionStates,
+		prStatusFor,
 		markEligible,
 		maybeCreateForTurn,
 		promptSectionText,
@@ -790,10 +1098,12 @@ export function createWorktreeLauncher(deps) {
  * Cordis plugin body: wire the controller to harness services and clean up
  * behind the plugin fiber.
  * @param {object} ctx - host cordis context (`webServer` + `subprocess` injected).
- * @param {object} [config] - row config `{ cwd?, enabled?, baseBranch?, fetchTimeoutMs?, debug? }`.
+ * @param {object} [config] - row config `{ cwd?, enabled?, baseBranch?, fetchTimeoutMs?, ghPath?, prTtlMs?, ghTimeoutMs?, debug? }`.
  */
 export function apply(ctx, config) {
 	const options = config ?? {};
+	const sessionQuery = ctx.get("sessionQuery");
+	const warn = options.debug ? (message) => console.warn(message) : undefined;
 	const launcher = createWorktreeLauncher({
 		spawn: (spec) => ctx.subprocess.spawn(spec),
 		resolveExecutable: (command) => ctx.subprocess.resolveExecutable(command),
@@ -801,8 +1111,12 @@ export function apply(ctx, config) {
 		baseBranch: typeof options.baseBranch === "string" ? options.baseBranch : undefined,
 		fetchTimeoutMs:
 			typeof options.fetchTimeoutMs === "number" ? options.fetchTimeoutMs : undefined,
+		ghPath: typeof options.ghPath === "string" ? options.ghPath : undefined,
+		prTtlMs: typeof options.prTtlMs === "number" ? options.prTtlMs : undefined,
+		ghTimeoutMs: typeof options.ghTimeoutMs === "number" ? options.ghTimeoutMs : undefined,
+		listSessionTitles: createSessionTitleLister(sessionQuery, { warn }),
 		enabled: options.enabled === false ? false : undefined,
-		warn: options.debug ? (message) => console.warn(message) : undefined,
+		warn,
 	});
 
 	const disposeRoute = ctx.webServer.register({
