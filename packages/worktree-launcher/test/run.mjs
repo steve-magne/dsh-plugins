@@ -385,6 +385,22 @@ await test("creates an isolated dsh-* worktree based on an up-to-date main", asy
 		url: "/worktree-launcher/api/worktrees",
 	});
 	assert.ok(listed.payload.worktrees.some((entry) => entry.branch === rec.branch));
+
+	// Sibling contract: @dsh-plugins/create-pr reads this index to route its
+	// pipeline at the session's OWN worktree.
+	const bindingsIndex = JSON.parse(
+		await readFile(join(projectA.root, ".dsh", "worktrees", "bindings.json"), "utf8"),
+	);
+	assert.equal(bindingsIndex.version, 1);
+	assert.ok(
+		bindingsIndex.bindings.some(
+			(entry) =>
+				entry.sessionId === "session-a" &&
+				entry.branch === rec.branch &&
+				entry.path === rec.path,
+		),
+		`binding index must map session-a -> ${rec.branch}`,
+	);
 });
 
 await test("still creates a worktree when the origin is unreachable (offline)", async () => {
@@ -503,6 +519,49 @@ await test("agent wiring: startup+turn1 auto-creates; resumes, subagents and lat
 	assert.equal(launcher.promptSectionText(undefined), "");
 });
 
+await test("concurrent turn-1 triggers bind ONE worktree; creationOf exposes the prompt gate", async () => {
+	const header = { cwd: projectNoRemote.root };
+
+	// Two simultaneous triggers for one eligible session (racing events or a
+	// double click): the per-repo chain plus the under-lock re-check must
+	// yield exactly one bound worktree.
+	const raceAgent = { id: "session-race", session: { header } };
+	launcher.markEligible({ agent: raceAgent, source: "startup" });
+	await Promise.all([
+		launcher.maybeCreateForTurn({ agent: raceAgent, turn: 1 }),
+		launcher.maybeCreateForTurn({ agent: raceAgent, turn: 1 }),
+	]);
+	const record = launcher.recordForSession("session-race");
+	assert.ok(record, "the race must still bind a worktree");
+	assert.match(record.branch, BRANCH_PATTERN);
+	const mine = launcher
+		.listWorktrees()
+		.filter((entry) => entry.sessionId === "session-race");
+	assert.equal(mine.length, 1, `one worktree per session, got ${mine.length}`);
+
+	// An in-flight creation is observable so the system-prompt assembly can
+	// hold turn 1 until the worktree exists; the gate clears once settled.
+	const gateAgent = { id: "session-gate", session: { header } };
+	launcher.markEligible({ agent: gateAgent, source: "startup" });
+	const inflight = launcher.maybeCreateForTurn({ agent: gateAgent, turn: 1 });
+	for (let attempt = 0; attempt < 100 && !launcher.creationOf("session-gate"); attempt += 1) {
+		await sleep(5);
+	}
+	assert.ok(launcher.creationOf("session-gate"), "in-flight creation exposes a gate");
+	await inflight;
+	assert.equal(launcher.creationOf("session-gate"), undefined, "gate clears when settled");
+	assert.ok(launcher.recordForSession("session-gate"), "gated creation completed");
+	assert.equal(launcher.creationOf("nobody"), undefined);
+
+	// Cleanup both.
+	for (const branch of [record.branch, launcher.recordForSession("session-gate").branch]) {
+		await call(launcher, {
+			method: "DELETE",
+			url: `/worktree-launcher/api/worktrees/${branch}?force=1`,
+		});
+	}
+});
+
 await test("removes a clean worktree, refuses a dirty one without force", async () => {
 	const dirty = await call(launcher, {
 		method: "POST",
@@ -530,6 +589,13 @@ await test("removes a clean worktree, refuses a dirty one without force", async 
 			.status,
 		404,
 		"binding must be dropped with the worktree",
+	);
+	const prunedIndex = JSON.parse(
+		await readFile(join(projectNoRemote.root, ".dsh", "worktrees", "bindings.json"), "utf8"),
+	);
+	assert.ok(
+		!prunedIndex.bindings.some((entry) => entry.sessionId === "session-dirty"),
+		"removal must also drop the session from the binding index",
 	);
 
 	// Clean removal path + guards.

@@ -1,6 +1,6 @@
 {
 	"name": "@dsh-plugins/create-pr",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "DSH web plugin: one-click GitHub pull request from the composer tool row — deterministic git/gh plumbing, one LLM call for the conventional-commit message, and a CI watchdog that wakes the owning session to fix failures",
 	"keywords": [
 		"dsh-plugin",

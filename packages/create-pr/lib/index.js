@@ -8,8 +8,11 @@
  *     (`conversation.input.left`, right beside the Worktree toggle);
  *   - clicking it starts a HOST-SIDE pipeline over `ctx.subprocess` whose every
  *     deterministic step is plain git/gh plumbing (no model tokens):
- *       1. resolve the repo (session cwd -> row config `cwd`), refuse the base
- *          branch and non-GitHub origins;
+ *       1. resolve the repo — explicit request `root`, else the worktree that
+ *          @dsh-plugins/worktree-launcher bound to the session (sibling
+ *          contract `<repo>/.dsh/worktrees/bindings.json`), else the session's
+ *          start cwd, else row config `cwd`; refuse the base branch and
+ *          non-GitHub origins;
  *       2. stage + commit uncommitted work — the conventional-commit message
  *          is an LLM call (`ctx.llm` one-shot, strict parse, deterministic
  *          fallback when the service is absent);
@@ -47,8 +50,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 /** Services this plugin needs before activation. */
 export const inject = ["webServer", "subprocess"];
@@ -72,6 +75,14 @@ const COMMIT_MAX_TOKENS = 350;
 const PR_MAX_TOKENS = 500;
 
 const BASE_BRANCHES = new Set(["main", "master"]);
+
+/**
+ * Sibling contract with @dsh-plugins/worktree-launcher (plugins never import
+ * each other, so the hand-off is a plain JSON index that launcher rewrites on
+ * every bind/unbind): `<repoTop>/.dsh/worktrees/bindings.json` holding
+ * `{version, bindings: [{sessionId, branch, path, …}]}`.
+ */
+const WORKTREE_BINDINGS_PARTS = [".dsh", "worktrees", "bindings.json"];
 
 /** Terminal run statuses: the client stops its pipeline polling on these. */
 export const TERMINAL_STATUSES = new Set([
@@ -417,6 +428,43 @@ export function extractPrUrl(text) {
 	return { url: match[0], number: Number(match[1]) };
 }
 
+/**
+ * Read the worktree that @dsh-plugins/worktree-launcher bound to `sessionId`
+ * in the repository at `top`, from the sibling `<top>/.dsh/worktrees/
+ * bindings.json` index. Returns `{path, branch}` with an absolute, still-
+ * existing path, or undefined when the index is absent, unreadable, corrupt,
+ * has no entry for the session, or points at a vanished directory — every
+ * degradation falls back to legacy resolution instead of failing the run.
+ */
+export async function readWorktreeBinding(top, sessionId) {
+	if (typeof top !== "string" || !top.trim()) return undefined;
+	if (typeof sessionId !== "string" || !sessionId.trim()) return undefined;
+	try {
+		const raw = await readFile(join(top, ...WORKTREE_BINDINGS_PARTS), "utf8");
+		const parsed = JSON.parse(raw);
+		const list = Array.isArray(parsed?.bindings) ? parsed.bindings : [];
+		let hit;
+		for (const entry of list) {
+			if (
+				entry &&
+				entry.sessionId === sessionId &&
+				typeof entry.path === "string" &&
+				entry.path.trim() &&
+				typeof entry.branch === "string" &&
+				entry.branch.trim()
+			) {
+				hit = entry; // last entry wins
+			}
+		}
+		if (!hit) return undefined;
+		const info = await stat(hit.path).catch(() => undefined);
+		if (!info?.isDirectory()) return undefined;
+		return { path: resolve(hit.path), branch: hit.branch };
+	} catch {
+		return undefined;
+	}
+}
+
 // ------------------------------------------------------------------ controller
 
 /**
@@ -604,16 +652,31 @@ export function createPrLauncher(deps) {
 		return top;
 	}
 
-	function rootFor(input) {
+	async function rootFor(input) {
 		const explicit =
 			typeof input.root === "string" && input.root.trim() ? resolve(input.root.trim()) : undefined;
-		if (explicit) return Promise.resolve(explicit);
-		if (typeof input.sessionId === "string" && input.sessionId.trim()) {
-			const agent = resolveAgent(input.sessionId.trim());
+		if (explicit) return explicit;
+		const sessionId =
+			typeof input.sessionId === "string" && input.sessionId.trim()
+				? input.sessionId.trim()
+				: undefined;
+		if (sessionId) {
+			const agent = resolveAgent(sessionId);
 			const cwd = agent?.session?.header?.cwd;
-			if (typeof cwd === "string" && cwd.trim()) return Promise.resolve(resolve(cwd));
+			if (typeof cwd === "string" && cwd.trim()) {
+				const anchor = resolve(cwd.trim());
+				// header.cwd stays the ORIGINAL checkout for the whole session,
+				// even after worktree-launcher equips the session with its own
+				// worktree. Route through the sibling binding first: two parallel
+				// sessions must each open their OWN pull request, never one
+				// shared PR assembling every session's work in the main checkout.
+				const anchorTop = await resolveRepoTop(anchor);
+				const bound = await readWorktreeBinding(anchorTop, sessionId);
+				if (bound) return bound.path;
+				return anchor;
+			}
 		}
-		if (defaultRoot) return Promise.resolve(defaultRoot);
+		if (defaultRoot) return defaultRoot;
 		throw httpStatusError(
 			400,
 			"cannot resolve a repository: provide 'root'/'sessionId' or configure the row's 'cwd'",

@@ -1,6 +1,6 @@
 {
 	"name": "@dsh-plugins/worktree-launcher",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "DSH web plugin: one isolated git worktree (branch dsh-word-word-word, based on an up-to-date main) materialized for every new chat session",
 	"keywords": [
 		"dsh-plugin",

@@ -12,9 +12,14 @@ once for the commit message (only when work is uncommitted), once for the PR
 title/summary (only when a PR is actually created; an adopted PR costs zero
 tokens):
 
-1. **Resolve** the repository: request `root` → owning session's `cwd` → row
-   config `cwd`. Refuses the base branch (`main`/`master`) and non-GitHub
-   origins.
+1. **Resolve** the repository: request `root` → the worktree
+   [@dsh-plugins/worktree-launcher](../worktree-launcher/) bound to the session
+   (sibling index `<repo>/.dsh/worktrees/bindings.json`; a vanished or corrupt
+   entry degrades silently) → owning session's start `cwd` → row config `cwd`.
+   The binding step is what keeps parallel sessions isolated: each session's
+   click opens ITS OWN pull request from its own worktree, never one shared PR
+   assembling every session's work. Refuses the base branch (`main`/`master`)
+   and non-GitHub origins.
 2. **Commit** uncommitted work (`git add -A` + `git commit`). The
    conventional-commit message comes from ONE `ctx.llm` streaming call over a
    truncated `git diff --cached --stat`/diff digest; off-format answers fall

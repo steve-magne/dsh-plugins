@@ -11,10 +11,10 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	CONVENTIONAL_SUBJECT_RE,
 	buildPrBody,
@@ -25,6 +25,7 @@ import {
 	parseConventionalMessage,
 	parseGitHubOwnerRepo,
 	parseStatEntries,
+	readWorktreeBinding,
 } from "../lib/index.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -292,7 +293,7 @@ function llmStub(subject, body) {
 	return llmScript([[subject, "", body ?? ""].join("\n")]);
 }
 
-function agentRecorder(sessionId) {
+function agentRecorder(sessionId, cwd) {
 	const recorder = {
 		sessionId,
 		followups: [],
@@ -300,6 +301,7 @@ function agentRecorder(sessionId) {
 			recorder.followups.push(message);
 		},
 	};
+	if (cwd) recorder.session = { header: { cwd } };
 	return recorder;
 }
 
@@ -763,6 +765,131 @@ await test("refuses to resolve a repository without any input", async () => {
 
 	launcher.shutdown();
 	await rm(project.dir, { recursive: true, force: true }).catch(() => {});
+}
+
+// Sibling contract: worktree-launcher rewrites <repo>/.dsh/worktrees/
+// bindings.json on every bind/unbind. A click carrying only sessionId must
+// route the pipeline at the BOUND worktree — two parallel sessions must open
+// two pull requests, never one shared PR assembling every session's work.
+{
+	const main = await makeProject();
+	// Mimic what worktree-launcher does to the shared checkout: keep the
+	// worktree area invisible to git status.
+	await writeFile(join(main.root, ".git", "info", "exclude"), ".dsh/worktrees/\n", "utf8");
+	const wtPath = join(main.root, ".dsh", "worktrees", "dsh-red-oak-elm");
+	git(["clone", "--quiet", main.origin, wtPath], main.dir);
+	git(["config", "user.email", "cpr@test.local"], wtPath);
+	git(["config", "user.name", "cpr-test"], wtPath);
+	git(["remote", "set-url", "origin", "https://github.com/acme/widget.git"], wtPath);
+	git(["config", `url.${main.origin}.insteadOf`, "https://github.com/acme/widget.git"], wtPath);
+	git(["checkout", "-q", "-b", "dsh-red-oak-elm"], wtPath);
+	await writeFile(join(wtPath, "isolated.ts"), "export const isolated = 1;\n", "utf8");
+	await writeFile(
+		join(main.root, ".dsh", "worktrees", "bindings.json"),
+		JSON.stringify({
+			version: 1,
+			bindings: [
+				{
+					sessionId: "session-bound",
+					branch: "dsh-red-oak-elm",
+					path: wtPath,
+					createdAt: Date.now(),
+				},
+			],
+		}),
+		"utf8",
+	);
+
+	await test("readWorktreeBinding: hit, miss, and vanished-path degradation", async () => {
+		assert.deepEqual(await readWorktreeBinding(main.root, "nobody"), undefined);
+		const bound = await readWorktreeBinding(main.root, "session-bound");
+		assert.equal(bound?.branch, "dsh-red-oak-elm");
+		assert.equal(resolve(bound?.path ?? ""), resolve(wtPath));
+	});
+
+	const agent = agentRecorder("session-bound", main.root);
+	const launcher = makeLauncher({ llm: llmStub("feat(widget): isolated lane", ""), agent });
+
+	await test("sessionId alone routes at the bound worktree, not the shared checkout", async () => {
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const created = await call(launcher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: agent.sessionId }, // deliberately NO root
+		});
+		const record = await waitFor(launcher, created.payload.id, ["passed"]);
+		assert.equal(record.branch, "dsh-red-oak-elm", "the run must use the bound branch");
+		assert.equal(record.commitSubject, "feat(widget): isolated lane");
+		assert.ok(existsSync(join(record.root ?? "", "isolated.ts")), "run cwd is the worktree");
+		const remote = git(["ls-remote", main.origin, "dsh-red-oak-elm"], main.dir).trim();
+		assert.ok(remote.length > 0, "bound branch pushed to origin from the worktree");
+		// The shared checkout stayed completely untouched.
+		const status = git(["status", "--porcelain"], main.root);
+		assert.equal(status.trim(), "", "the main checkout must stay clean");
+		assert.notEqual(record.branch, "feat/widget");
+	});
+
+	await test("an explicit root overrides the binding (documented escape hatch)", async () => {
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const created = await call(launcher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: agent.sessionId, root: main.root },
+		});
+		const record = await waitFor(launcher, created.payload.id, ["passed"]);
+		assert.equal(record.branch, "feat/widget", "explicit root wins over the binding");
+		assert.equal(record.commitSubject, null, "clean tree commits nothing");
+	});
+	launcher.shutdown();
+
+	await test("a vanished or corrupt binding degrades to legacy session-cwd resolution", async () => {
+		const strayAgent = agentRecorder("session-stale", main.root);
+		const staleLauncher = makeLauncher({ llm: llmStub("fix(widget): stray recovery", ""), agent: strayAgent });
+		await writeFile(join(main.root, "stray.ts"), "export const stray = 1;\n", "utf8");
+
+		// Stale entry pointing at a vanished directory.
+		await writeFile(
+			join(main.root, ".dsh", "worktrees", "bindings.json"),
+			JSON.stringify({
+				version: 1,
+				bindings: [
+					{
+						sessionId: "session-stale",
+						branch: "dsh-gone-gone-gone",
+						path: join(main.dir, "vanished"),
+						createdAt: 1,
+					},
+				],
+			}),
+			"utf8",
+		);
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const staleRun = await call(staleLauncher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: "session-stale" },
+		});
+		const staleRecord = await waitFor(staleLauncher, staleRun.payload.id, ["passed"]);
+		assert.equal(staleRecord.branch, "feat/widget", "stale binding falls back to session cwd");
+
+		// Corrupt index JSON degrades identically.
+		await writeFile(join(main.root, ".dsh", "worktrees", "bindings.json"), "{not json", "utf8");
+		fakeStateDir = await makeStateDir();
+		await writeState(fakeStateDir, "checks.json", ROLLUP_SUCCESS);
+		const corruptRun = await call(staleLauncher, {
+			method: "POST",
+			url: "/create-pr/api/create",
+			body: { sessionId: "session-stale" },
+		});
+		const corruptRecord = await waitFor(staleLauncher, corruptRun.payload.id, ["passed"]);
+		assert.equal(corruptRecord.branch, "feat/widget", "corrupt binding falls back too");
+		staleLauncher.shutdown();
+	});
+
+	await rm(main.dir, { recursive: true, force: true }).catch(() => {});
 }
 
 // Clean tree with several existing commits and a useless LLM: this is exactly
