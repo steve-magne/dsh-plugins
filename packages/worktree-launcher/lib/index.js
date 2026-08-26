@@ -9,10 +9,11 @@
  *     branch/path chip under the composer card (`conversation.composer.dock`);
  *   - when a fresh session publishes (`agent/session-start`, source
  *     `startup`, never subagents/forks/resumes) the session is marked
- *     eligible, and its first real message (`agent/inbox/inserted`, turn 1)
- *     materializes a worktree under `<repo>/.dsh/worktrees/dsh-w1-w2-w3`
- *     based on an up-to-date main (best-effort `git fetch` + fast-forward —
- *     never an unsafe pull), with `main` left untouched when checked out;
+ *     eligible, and its first real message (`agent/inbox/claimed`, turn 1 —
+ *     the event whose payload actually carries `turn`) materializes a
+ *     worktree under `<repo>/.dsh/worktrees/dsh-w1-w2-w3` based on an
+ *     up-to-date main (best-effort `git fetch` + fast-forward — never an
+ *     unsafe pull), with `main` left untouched when checked out;
  *   - a scoped system-prompt section tells the model to work inside that
  *     worktree for the whole session;
  *   - a session-list status endpoint joins every bound record with its
@@ -24,6 +25,12 @@
  * HTTP surface: a small loopback-only JSON API under `/worktree-launcher/api`
  * (preference get/set, create, list, per-session lookup, remove, and the
  * per-session git/PR state feed).
+ *
+ * Sibling contract: every bind/unbind also rewrites
+ * `<repo>/.dsh/worktrees/bindings.json` — a plain JSON index of
+ * `{sessionId, branch, path}` records that @dsh-plugins/create-pr reads to
+ * route "Create PR" at the session's OWN worktree (plugins never import each
+ * other; this file is the shared vocabulary).
  *
  * Trust posture matches @dsh-plugins/command-deck: the harness web server
  * binds loopback without auth by design; this surface adds a Host allowlist
@@ -49,6 +56,8 @@ export const BRANCH_PATTERN = /^dsh-[a-z]{3,12}-[a-z]{3,12}-[a-z]{3,12}$/;
 const WORKTREE_DIR_PARTS = [".dsh", "worktrees"];
 const IGNORE_PATH = ".dsh/worktrees";
 const IGNORE_LINE = `${IGNORE_PATH}/`;
+/** Sibling contract read by @dsh-plugins/create-pr (see header comment). */
+const BINDINGS_FILE_PARTS = [...WORKTREE_DIR_PARTS, "bindings.json"];
 
 /** Session-title cache TTL for the badge feed (`session-states`). */
 const TITLE_TTL_MS = 30_000;
@@ -296,6 +305,8 @@ export function createWorktreeLauncher(deps) {
 	const eligible = new Set();
 	/** One in-flight creation chain per repo top, serializing git mutations. */
 	const chains = new Map();
+	/** sessionId -> in-flight creation promise (the prompt-assembly gate). */
+	const pendingCreates = new Map();
 
 	/** Resolved-binary cache keyed by kind ("git" | "gh"); failed lookups retry. */
 	const executables = new Map();
@@ -655,10 +666,26 @@ export function createWorktreeLauncher(deps) {
 			top,
 			run.catch(() => {}),
 		);
+		if (sid) {
+			// Track the whole attempt so the system-prompt assembly can hold turn
+			// 1 until this session's worktree definitely exists (or failed).
+			let tracked = run.finally(() => {
+				if (pendingCreates.get(sid) === tracked) pendingCreates.delete(sid);
+			});
+			run.catch(() => {}); // the map keeps its own settled copy
+			pendingCreates.set(sid, tracked);
+		}
 		return run;
 	}
 
 	async function createLocked({ top, sid }) {
+		// Re-check under the repo chain: two concurrent triggers for one session
+		// (double click, racing events) must bind ONE worktree, not two.
+		if (sid) {
+			const boundBranch = bySession.get(sid);
+			const bound = boundBranch ? records.get(boundBranch) : undefined;
+			if (bound) return { ...publicRecord(bound), created: false };
+		}
 		const { commonDir } = await resolveRepo(top);
 		const worktreeDir = join(top, ...WORKTREE_DIR_PARTS);
 		await mkdir(worktreeDir, { recursive: true });
@@ -697,7 +724,38 @@ export function createWorktreeLauncher(deps) {
 		};
 		records.set(newBranch, record);
 		if (sid) bySession.set(sid, newBranch);
+		await persistBindings(top);
 		return { ...publicRecord(record), created: true };
+	}
+
+	/**
+	 * Rewrite the sibling-contract index at
+	 * `<top>/.dsh/worktrees/bindings.json`: one entry per session-bound
+	 * worktree, read by @dsh-plugins/create-pr to route its pipeline at the
+	 * owning session's worktree instead of the session's original checkout.
+	 */
+	async function persistBindings(top) {
+		try {
+			const bindings = [...records.values()]
+				.filter((record) => record.sessionId)
+				.map((record) => ({
+					sessionId: record.sessionId,
+					branch: record.branch,
+					path: record.path,
+					root: record.root,
+					baseBranch: record.baseBranch,
+					createdAt: record.createdAt,
+				}));
+			const target = join(top, ...BINDINGS_FILE_PARTS);
+			await mkdir(dirname(target), { recursive: true });
+			await writeFile(
+				target,
+				`${JSON.stringify({ version: 1, bindings }, null, "\t")}\n`,
+				"utf8",
+			);
+		} catch (error) {
+			warn(`worktree-launcher: could not write bindings index: ${error?.message ?? error}`);
+		}
 	}
 
 	function removeWorktree(branch, options = {}) {
@@ -725,6 +783,7 @@ export function createWorktreeLauncher(deps) {
 			for (const [sid, bound] of bySession) {
 				if (bound === branch) bySession.delete(sid);
 			}
+			await persistBindings(record.root);
 			return publicRecord(record);
 		})();
 	}
@@ -891,10 +950,11 @@ export function createWorktreeLauncher(deps) {
 	}
 
 	/**
-	 * Event listener body for `agent/inbox/inserted`: materialize the worktree
-	 * on the session's FIRST real message, so merely browsing blank workspaces
-	 * does not litter disk. Fire-and-forget by contract; failures degrade
-	 * silently (the chip simply never appears).
+	 * Event listener body for `agent/inbox/claimed`: materialize the worktree
+	 * on the session's FIRST real message (the claimed payload is the one that
+	 * actually carries `turn`), so merely browsing blank workspaces does not
+	 * litter disk. Fire-and-forget by contract; failures degrade silently
+	 * (the chip simply never appears).
 	 */
 	async function maybeCreateForTurn(payload) {
 		const agent = payload?.agent;
@@ -1069,6 +1129,7 @@ export function createWorktreeLauncher(deps) {
 		bySession.clear();
 		eligible.clear();
 		chains.clear();
+		pendingCreates.clear();
 		prCache.clear();
 		titleCache = { at: 0, byId: new Map() };
 	}
@@ -1086,6 +1147,9 @@ export function createWorktreeLauncher(deps) {
 		removeWorktree,
 		listWorktrees,
 		recordForSession,
+		/** In-flight creation promise for a session, or undefined when idle. */
+		creationOf: (sessionId) =>
+			typeof sessionId === "string" ? pendingCreates.get(sessionId) : undefined,
 		sessionStates,
 		prStatusFor,
 		markEligible,
@@ -1130,9 +1194,48 @@ export function apply(ctx, config) {
 	const disposeSessionStart = ctx.on("agent/session-start", (payload) => {
 		void Promise.resolve(launcher.markEligible(payload)).catch(() => {});
 	});
-	const disposeInbox = ctx.on("agent/inbox/inserted", (payload) => {
+	// `claimed` (not `inserted`): only the claimed payload carries `turn`, and
+	// the old inserted listener could therefore NEVER fire its turn===1 gate.
+	const disposeInbox = ctx.on("agent/inbox/claimed", (payload) => {
 		void Promise.resolve(launcher.maybeCreateForTurn(payload)).catch(() => {});
 	});
+
+	/**
+	 * Turn 1's prompt must not assemble while that session's worktree is still
+	 * materializing (`git fetch` + `worktree add` can take seconds): hold the
+	 * assembly waterfall until the in-flight creation settles, bounded by the
+	 * fetch budget plus slack so a wedged git never wedges the model loop.
+	 */
+	const promptGateMs =
+		(typeof options.fetchTimeoutMs === "number" && options.fetchTimeoutMs > 0
+			? options.fetchTimeoutMs
+			: DEFAULT_FETCH_TIMEOUT_MS) + 5_000;
+	const disposeAssemble = ctx.on(
+		"system-prompt/assemble",
+		async (assembly, context, next) => {
+			const scope = context && typeof context === "object" ? context.scope : undefined;
+			let sessionId;
+			if (scope && typeof scope === "object" && typeof scope.id === "string") {
+				sessionId = scope.id;
+			} else if (typeof scope === "string") {
+				sessionId = scope;
+			}
+			const pending = launcher.creationOf(sessionId);
+			if (!pending) return next();
+			let gate;
+			try {
+				await Promise.race([
+					pending.catch(() => {}),
+					new Promise((resolve) => {
+						gate = setTimeout(resolve, promptGateMs);
+					}),
+				]);
+			} finally {
+				clearTimeout(gate);
+			}
+			return next();
+		},
+	);
 
 	const systemPrompt = ctx.get("systemPrompt");
 	let disposeSection;
@@ -1148,6 +1251,7 @@ export function apply(ctx, config) {
 		disposeRoute();
 		disposeSessionStart?.();
 		disposeInbox?.();
+		disposeAssemble?.();
 		disposeSection?.();
 		launcher.shutdown();
 	});

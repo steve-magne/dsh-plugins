@@ -22,7 +22,8 @@ on each other's files.
 2. When a brand-new session publishes (`agent/session-start`, source `startup`
    only), it is marked eligible. Resumed, forked, compacted sessions and
    subagents never are.
-3. On that session's **first real message** (`agent/inbox/inserted`, turn 1)
+3. On that session's **first real message** (`agent/inbox/claimed`, turn 1 —
+   the event whose payload actually carries `turn`)
    the host materializes the worktree:
    - location `<repo>/.dsh/worktrees/dsh-word-word-word`;
    - branch `dsh-` + three random words joined by `-`, minted collision-free;
@@ -35,6 +36,10 @@ on each other's files.
      `git status` stays clean.
 4. A scoped system-prompt section tells the model to run everything inside the
    worktree for that session; a chip under the composer shows branch and path.
+   While a worktree is still materializing, the host holds that session's
+   `system-prompt/assemble` waterfall (bounded by the fetch budget) so turn 1
+   never assembles without the section — the model cannot accidentally work
+   in the shared checkout.
 5. **Session-list git badges.** A headless overlay entry polls
    `GET /api/session-states` and paints a small git logo on each sidebar
    session row — between the row's title and its relative-time label — colored
@@ -66,7 +71,7 @@ Dual-face cordis plugin, the same shape as `@dsh-plugins/command-deck`:
 
 | Half | File | Role |
 | --- | --- | --- |
-| Host | `lib/index.js` | Registers a `prefix` route `/worktree-launcher/api` on `ctx.webServer`; runs git through `ctx.subprocess`; listens to `agent/session-start` / `agent/inbox/inserted`; contributes a scoped `systemPrompt.section` |
+| Host | `lib/index.js` | Registers a `prefix` route `/worktree-launcher/api` on `ctx.webServer`; runs git through `ctx.subprocess`; listens to `agent/session-start` / `agent/inbox/claimed` (plus a bounded `system-prompt/assemble` gate); contributes a scoped `systemPrompt.section` |
 | Browser | `lib/client.js` | Lazy-CJS factory bundle; injects into the runtime-owned `conversation.input.left`, `conversation.composer.dock` and `shell.overlay` slots (the last one paints the session-list git badges); zero deps beyond shell-seeded React |
 
 The browser discovers the client bundle automatically: the node half of
@@ -124,6 +129,20 @@ All endpoints answer JSON under the prefix route:
 - `GET    /worktree-launcher/api/session-states` → badge feed: `{states:[{sessionId,
   title, state: created\|pr\|problem\|merged, branch, prNumber?, prUrl?}]}` — one
   entry per worktree whose session title resolved (records newest first)
+
+### Sibling contract: `bindings.json`
+
+Every bind/unbind also rewrites `<repo>/.dsh/worktrees/bindings.json`
+(inside the git-excluded area):
+
+```json
+{ "version": 1, "bindings": [ { "sessionId": "…", "branch": "dsh-…", "path": "/abs/path", "root": "…", "baseBranch": "main", "createdAt": 0 } ] }
+```
+
+[@dsh-plugins/create-pr](../create-pr/) reads this index to route its
+pipeline at the owning session's worktree — plugins never import each other,
+so this plain file is the shared vocabulary. The index intentionally survives
+harness restarts.
 
 Trust posture matches the harness web server itself: loopback bind, no auth,
 plus a Host allowlist (`localhost`/`127.0.0.1`/`[::1]`) against DNS rebinding
