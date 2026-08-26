@@ -1,0 +1,51 @@
+{
+	"name": "@dsh-plugins/mission-control",
+	"version": "0.1.0",
+	"description": "DeepSeek Harness plugin: a GitHub-Copilot-app-style 'My Work' triage inbox for the web surface — review requests, your open PRs and assigned issues in one list, each hand-offable to a running agent session in an isolated worktree",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"web-ui",
+		"github",
+		"inbox",
+		"triage",
+		"agents"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/mission-control#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/mission-control"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
+	"type": "module",
+	"main": "./lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"dsh": {
+		"client": {
+			"platform": "web",
+			"inject": []
+		}
+	}
+}

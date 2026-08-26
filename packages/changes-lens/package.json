@@ -1,0 +1,51 @@
+{
+	"name": "@dsh-plugins/changes-lens",
+	"version": "0.1.0",
+	"description": "DeepSeek Harness plugin: a GitHub-Copilot-app-style Changes canvas for the web surface — inspect any checkout's pending work (branch/sync state, per-file staged/unstaged/untracked entries, unified diffs) and pin recovery snapshots of uncommitted tracked work under refs/dsh-changes-lens/*",
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"deepseek",
+		"cordis",
+		"web-ui",
+		"git",
+		"diff",
+		"review",
+		"recovery"
+	],
+	"homepage": "https://github.com/steve-magne/dsh-plugins/tree/main/packages/changes-lens#readme",
+	"bugs": {
+		"url": "https://github.com/steve-magne/dsh-plugins/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steve-magne/dsh-plugins.git",
+		"directory": "packages/changes-lens"
+	},
+	"license": "MIT",
+	"author": {
+		"name": "Steve Magne",
+		"url": "https://github.com/steve-magne"
+	},
+	"type": "module",
+	"main": "./lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"dsh": {
+		"client": {
+			"platform": "web",
+			"inject": []
+		}
+	}
+}
