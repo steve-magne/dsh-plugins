@@ -17,6 +17,9 @@ releases or inherit product quality gates.
 | [`@dsh-plugins/agent-terminal`](packages/agent-terminal/) | "Agent Terminal" overlay: interactive takeover console — allocate terminals on the harness host (PTY when available), watch their live output, type into them, interrupt them |
 | [`@dsh-plugins/voice-input`](packages/voice-input/) | Mic toggle in the composer tool row: on-device voice dictation through the browser Speech API or a loopback-only local ASR server (whisper.cpp style) |
 | [`@dsh-plugins/issue-starter`](packages/issue-starter/) | "Issues → Sessions" overlay: preview a GitHub issue, cut an isolated worktree from an up-to-date base, and launch a live agent session scoped to it (nudge included) |
+| [`@dsh-plugins/mission-control`](packages/mission-control/) | "Mission Control" overlay: a GitHub-Copilot-app-style *My Work* triage inbox — review requests, your open PRs, assigned issues — each hand-offable to a running agent session in an isolated worktree |
+| [`@dsh-plugins/changes-lens`](packages/changes-lens/) | "Changes Lens" overlay: a Copilot-app-style *Changes canvas* over any checkout — branch/sync state, staged/unstaged/untracked inventory with +/- stats, capped unified diffs, and recovery snapshots pinned under `refs/dsh-changes-lens/*` |
+| [`@dsh-plugins/merge-pilot`](packages/merge-pilot/) | "Merge Pilot" overlay: a Copilot-app-style *Agent Merge* — register any PR and a host-side supervisor watches CI + reviews, wakes your session with failure logs or reviewer objections, then merges (squash/merge/rebase) when conditions are met |
 
 ## Repository layout
 
